@@ -1,12 +1,23 @@
 export class LocalClient {
-  async request(path, { method="GET", body }={}) {
-    const response = await fetch(path, {
-      method,
-      credentials: "same-origin",
-      headers: { ...(body?{"Content-Type":"application/json"}:{}), ...(method!=="GET"?{"X-ZhangGui-Request":"1"}:{}) },
-      body: body ? JSON.stringify(body) : undefined,
-      cache: "no-store"
-    });
+  async request(path, { method="GET", body, timeout=15000 }={}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    let response;
+    try {
+      response = await fetch(path, {
+        method,
+        credentials: "same-origin",
+        headers: { ...(body?{"Content-Type":"application/json"}:{}), ...(method!=="GET"?{"X-ZhangGui-Request":"1"}:{}) },
+        body: body ? JSON.stringify(body) : undefined,
+        cache: "no-store",
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") throw new Error("连接店内电脑超时，请确认手机已连接与电脑相同的Wi-Fi后重试");
+      throw new Error("无法连接店内电脑，请确认手机已连接与电脑相同的Wi-Fi");
+    } finally {
+      clearTimeout(timer);
+    }
     const result = await response.json().catch(()=>({error:`请求失败 (${response.status})`}));
     if (!response.ok) throw new Error(result.error || "请求失败");
     return result;
@@ -48,10 +59,10 @@ export class LocalClient {
   scanStocktake(id,code){return this.request(`/api/stocktakes/${encodeURIComponent(id)}/scan`,{method:"POST",body:{code}});}
   completeStocktake(id){return this.request(`/api/stocktakes/${encodeURIComponent(id)}/complete`,{method:"POST",body:{}});}
   recognizeQr(image){return this.request("/api/scan/recognize",{method:"POST",body:{image}});}
-  recognizeScreenshot(image){return this.request("/api/devices/screenshot/recognize",{method:"POST",body:{image}});}
+  recognizeScreenshot(image){return this.request("/api/devices/screenshot/recognize",{method:"POST",body:{image},timeout:60000});}
   intake(data){return this.request("/api/devices/intake",{method:"POST",body:data});}
   printLabel(id){return this.request(`/api/devices/${encodeURIComponent(id)}/print`,{method:"POST",body:{}});}
-  sell(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/sell`,{method:"POST",body:data});}
+  sell(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/sell`,{method:"POST",body:data,timeout:10000});}
   events(){return this.request("/api/events");}
   access(){return this.request("/api/access");}
 }
