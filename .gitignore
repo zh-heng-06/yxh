@@ -1,0 +1,28 @@
+apps/web/config.js
+apps/print-agent/config.json
+apps/print-agent/logs/
+apps/print-agent/__pycache__/
+.env
+dist/
+
+# 门店真实数据、截图、照片、备份和运行日志禁止上传
+apps/local-server/data/
+apps/local-server/test-data/
+tmp-*/
+docs/acceptance/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.pid
+
+# 本机安装的二进制依赖可用 requirements.txt 重新安装
+apps/local-server/vendor/
+apps/local-server/vendor-ocr/
+apps/local-server/vendor-qr/
+
+# 编译与缓存
+__pycache__/
+*.py[cod]
+apps/print-agent/bin/
+apps/print-agent/obj/
