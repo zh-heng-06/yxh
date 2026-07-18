@@ -118,6 +118,8 @@ def migrate_db() -> None:
                 purchase_cost_snapshot=case when purchase_cost_snapshot=0 then coalesce((select purchase_cost from device_financials where device_id=sales.device_id),0) else purchase_cost_snapshot end
             """)
             db.execute("insert into schema_migrations(version,applied_at) values(2,?)", (now_iso(),))
+        if 3 not in applied:
+            db.execute("insert into schema_migrations(version,applied_at) values(3,?)", (now_iso(),))
 
 
 def database_check() -> str:
@@ -183,6 +185,20 @@ def lan_ip() -> str:
 
 def rowdict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row else None
+
+
+def median_value(values: list[float]) -> float | None:
+    ordered = sorted(float(value) for value in values if value is not None)
+    if not ordered:
+        return None
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def rounded_range(center: float | None, spread: float) -> list[float] | None:
+    if center is None or center <= 0:
+        return None
+    return [max(0, round(center * (1 - spread) / 10) * 10), round(center * (1 + spread) / 10) * 10]
 
 
 def decode_qr_image(image_bytes: bytes) -> str:
@@ -319,6 +335,12 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.send_json(self.report_summary(self.current_user()))
             if path == "/api/ledger":
                 return self.send_json(self.daily_ledger(self.current_user()))
+            if path == "/api/market/quotes":
+                return self.send_json(self.list_market_quotes(self.current_user()))
+            if path == "/api/market/summary":
+                return self.send_json(self.market_summary(self.current_user()))
+            if path == "/api/market/decisions":
+                return self.send_json(self.list_pricing_decisions(self.current_user()))
             if path == "/api/smart/daily-summary":
                 return self.send_json(self.smart_daily_summary(self.current_user()))
             if path.startswith("/api/devices/") and path.endswith("/price-suggestion"):
@@ -364,6 +386,12 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.recognize_qr(self.current_user(), self.read_json(15_000_000))
             if path == "/api/smart/parse-intake":
                 return self.send_json(self.parse_intake_text(self.current_user(), self.read_json()))
+            if path == "/api/market/quotes":
+                return self.create_market_quote(self.current_user(), self.read_json())
+            if path.startswith("/api/market/quotes/") and path.endswith("/delete"):
+                return self.delete_market_quote(self.current_user(), path.split("/")[4])
+            if path == "/api/market/decisions":
+                return self.create_pricing_decision(self.current_user(), self.read_json())
             if path == "/api/import/devices.csv":
                 return self.import_devices_csv(self.current_user(), self.read_json(5_000_000))
             if path == "/api/devices/intake": return self.intake(self.current_user(), self.read_json())
@@ -950,6 +978,158 @@ class StoreHandler(SimpleHTTPRequestHandler):
         imei=re.search(r"\b(\d{15})\b",compact)
         if imei: result["imei"]=imei.group(1)
         result["sourceText"]=text; result["mode"]="local-rules"; return result
+
+    def market_filters(self) -> dict:
+        query = parse_qs(urlparse(self.path).query)
+        return {key: query.get(key, [""])[0].strip() for key in ("model", "storage", "conditionGrade", "batteryHealth", "repairStatus")}
+
+    def require_market_owner(self, user: dict) -> None:
+        if user["role"] != "owner":
+            raise ApiError(HTTPStatus.FORBIDDEN, "只有老板可以查看和维护行情")
+
+    def list_market_quotes(self, user: dict) -> list[dict]:
+        self.require_market_owner(user)
+        filters = self.market_filters()
+        sql = """select q.*,u.display_name creator_name from market_quotes q
+                 join users u on u.id=q.created_by where q.shop_id=?"""
+        args: list = [user["shop_id"]]
+        if filters["model"]:
+            sql += " and lower(q.model)=lower(?)"; args.append(filters["model"])
+        if filters["storage"]:
+            sql += " and lower(q.storage)=lower(?)"; args.append(filters["storage"])
+        sql += " order by q.captured_on desc,q.created_at desc limit 200"
+        with connect() as db:
+            return [dict(row) for row in db.execute(sql, args)]
+
+    def create_market_quote(self, user: dict, data: dict) -> None:
+        self.require_market_owner(user)
+        source = str(data.get("sourceName", "")).strip()
+        quote_type = str(data.get("quoteType", "")).strip()
+        model = str(data.get("model", "")).strip()
+        storage = str(data.get("storage", "")).strip().upper()
+        repair_status = str(data.get("repairStatus", "unknown")).strip() or "unknown"
+        try:
+            price = float(data.get("price") or 0)
+            battery = int(data["batteryHealth"]) if str(data.get("batteryHealth", "")).strip() else None
+            captured_on = datetime.strptime(str(data.get("capturedOn", "")), "%Y-%m-%d").date().isoformat()
+        except (TypeError, ValueError):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "价格、电池或报价日期格式不正确")
+        if not source or not model or not storage or price <= 0 or quote_type not in ("recycle", "retail"):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "请完整填写来源、报价类型、型号、容量和价格")
+        if battery is not None and not 0 <= battery <= 100:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "电池健康应为0到100")
+        if repair_status not in ("original", "no_repair", "minor_repair", "major_repair", "unknown"):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "拆修情况不正确")
+        quote_id, stamp = str(uuid.uuid4()), now_iso()
+        with WRITE_LOCK, connect() as db:
+            db.execute("""insert into market_quotes(id,shop_id,source_name,quote_type,brand,model,storage,condition_grade,battery_health,repair_status,price,captured_on,note,created_by,created_at)
+                          values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       (quote_id,user["shop_id"],source,quote_type,str(data.get("brand", "")).strip(),model,storage,str(data.get("conditionGrade", "")).strip(),battery,repair_status,price,captured_on,str(data.get("note", "")).strip(),user["id"],stamp))
+        self.send_json({"ok": True, "id": quote_id}, HTTPStatus.CREATED)
+
+    def delete_market_quote(self, user: dict, quote_id: str) -> None:
+        self.require_market_owner(user)
+        with WRITE_LOCK, connect() as db:
+            cursor = db.execute("delete from market_quotes where id=? and shop_id=?", (quote_id,user["shop_id"]))
+            if not cursor.rowcount:
+                raise ApiError(HTTPStatus.NOT_FOUND, "行情记录不存在")
+        self.send_json({"ok": True})
+
+    def market_summary(self, user: dict) -> dict:
+        self.require_market_owner(user)
+        filters = self.market_filters()
+        model, storage = filters["model"], filters["storage"].upper()
+        if not model:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "请先填写需要查询的型号")
+        quote_sql = "select quote_type,price,source_name,captured_on from market_quotes where shop_id=? and lower(model)=lower(?)"
+        quote_args: list = [user["shop_id"], model]
+        if storage:
+            quote_sql += " and lower(storage)=lower(?)"; quote_args.append(storage)
+        if filters["conditionGrade"]:
+            quote_sql += " and (condition_grade=? or condition_grade='')"; quote_args.append(filters["conditionGrade"])
+        if filters["batteryHealth"]:
+            try: battery = int(filters["batteryHealth"])
+            except ValueError: raise ApiError(HTTPStatus.BAD_REQUEST, "电池健康格式不正确")
+            quote_sql += " and (battery_health is null or abs(battery_health-?)<=5)"; quote_args.append(battery)
+        if filters["repairStatus"] and filters["repairStatus"] != "unknown":
+            quote_sql += " and (repair_status=? or repair_status='unknown')"; quote_args.append(filters["repairStatus"])
+        quote_sql += " order by captured_on desc limit 200"
+        device_filter = "d.shop_id=? and lower(d.model)=lower(?)"
+        device_args: list = [user["shop_id"], model]
+        if storage:
+            device_filter += " and lower(d.storage)=lower(?)"; device_args.append(storage)
+        with connect() as db:
+            quotes = [dict(row) for row in db.execute(quote_sql, quote_args)]
+            sales = [float(row[0]) for row in db.execute(f"select s.sale_price from sales s join devices d on d.id=s.device_id where {device_filter} order by s.sold_at desc limit 50", device_args)]
+            inventory = [dict(row) for row in db.execute(f"select d.list_price,f.purchase_cost from devices d join device_financials f on f.device_id=d.id where {device_filter} and d.deleted_at is null order by d.created_at desc limit 50", device_args)]
+        recycle = [row["price"] for row in quotes if row["quote_type"] == "recycle"]
+        retail = [row["price"] for row in quotes if row["quote_type"] == "retail"]
+        recycle_median, retail_median = median_value(recycle), median_value(retail)
+        sales_median = median_value(sales)
+        list_median = median_value([row["list_price"] for row in inventory])
+        cost_median = median_value([row["purchase_cost"] for row in inventory])
+        purchase_center = recycle_median or cost_median or (sales_median * .82 if sales_median else None) or (retail_median * .78 if retail_median else None)
+        sale_evidence = [value for value in (retail_median, sales_median, list_median) if value]
+        sale_center = (sum(sale_evidence) / len(sale_evidence)) if sale_evidence else (recycle_median * 1.15 if recycle_median else None)
+        purchase_range, sale_range = rounded_range(purchase_center, .04), rounded_range(sale_center, .04)
+        evidence_count = len(quotes) + len(sales)
+        confidence = "high" if evidence_count >= 8 and bool(recycle) and bool(retail or sales) else ("medium" if evidence_count >= 3 else "low")
+        sources = sorted({row["source_name"] for row in quotes})
+        basis = []
+        if recycle: basis.append(f"外部回收价{len(recycle)}条")
+        if retail: basis.append(f"外部零售价{len(retail)}条")
+        if sales: basis.append(f"店内成交{len(sales)}笔")
+        if inventory: basis.append(f"当前同款库存{len(inventory)}台")
+        return {
+            "query": filters,
+            "external": {"recycleCount":len(recycle),"recycleMedian":recycle_median,"retailCount":len(retail),"retailMedian":retail_median,"sources":sources},
+            "internal": {"salesCount":len(sales),"salesMedian":sales_median,"inventoryCount":len(inventory),"listMedian":list_median,"costMedian":cost_median},
+            "suggestion": {"purchaseRange":purchase_range,"saleRange":sale_range,"estimatedMargin":(sale_range[0]-purchase_range[1]) if sale_range and purchase_range else None,"confidence":confidence,"basis":"、".join(basis) or "暂无同款证据"},
+            "notice": "建议价只用于辅助判断，外部行情与门店历史相互独立，最终价格由老板确认。",
+            "mode": "local-evidence"
+        }
+
+    def create_pricing_decision(self, user: dict, data: dict) -> None:
+        self.require_market_owner(user)
+        model, storage = str(data.get("model", "")).strip(), str(data.get("storage", "")).strip().upper()
+        try:
+            final_purchase = float(data["finalPurchasePrice"]) if str(data.get("finalPurchasePrice", "")).strip() else None
+            final_sale = float(data["finalSalePrice"]) if str(data.get("finalSalePrice", "")).strip() else None
+            battery = int(data["batteryHealth"]) if str(data.get("batteryHealth", "")).strip() else None
+        except (TypeError, ValueError):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "最终价格或电池健康格式不正确")
+        if not model or not storage or (final_purchase is None and final_sale is None):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "请填写型号、容量以及至少一个最终价格")
+        if any(value is not None and value < 0 for value in (final_purchase, final_sale)):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "最终价格不能小于0")
+        suggestion = data.get("suggestion") if isinstance(data.get("suggestion"), dict) else {}
+        purchase_range = suggestion.get("purchaseRange") if isinstance(suggestion.get("purchaseRange"), list) else [None,None]
+        sale_range = suggestion.get("saleRange") if isinstance(suggestion.get("saleRange"), list) else [None,None]
+        evidence = data.get("evidence") if isinstance(data.get("evidence"), dict) else {}
+        stamp, decision_id = now_iso(), str(uuid.uuid4())
+        with WRITE_LOCK, connect() as db:
+            device_id = str(data.get("deviceId", "")).strip() or None
+            if device_id and not db.execute("select 1 from devices where id=? and shop_id=?",(device_id,user["shop_id"])).fetchone():
+                raise ApiError(HTTPStatus.BAD_REQUEST, "关联库存设备不存在")
+            db.execute("""insert into pricing_decisions(id,shop_id,device_id,brand,model,storage,condition_grade,battery_health,repair_status,suggested_purchase_low,suggested_purchase_high,suggested_sale_low,suggested_sale_high,final_purchase_price,final_sale_price,adjustment_reason,evidence_snapshot,created_by,created_at)
+                          values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       (decision_id,user["shop_id"],device_id,str(data.get("brand", "")).strip(),model,storage,str(data.get("conditionGrade", "")).strip(),battery,str(data.get("repairStatus", "unknown")),purchase_range[0] if len(purchase_range)>0 else None,purchase_range[1] if len(purchase_range)>1 else None,sale_range[0] if len(sale_range)>0 else None,sale_range[1] if len(sale_range)>1 else None,final_purchase,final_sale,str(data.get("adjustmentReason", "")).strip(),json.dumps(evidence,ensure_ascii=False)[:20000],user["id"],stamp))
+        self.send_json({"ok": True, "id": decision_id}, HTTPStatus.CREATED)
+
+    def list_pricing_decisions(self, user: dict) -> list[dict]:
+        self.require_market_owner(user)
+        filters = self.market_filters()
+        sql = "select p.*,u.display_name creator_name from pricing_decisions p join users u on u.id=p.created_by where p.shop_id=?"
+        args: list = [user["shop_id"]]
+        if filters["model"]:
+            sql += " and lower(p.model)=lower(?)"; args.append(filters["model"])
+        if filters["storage"]:
+            sql += " and lower(p.storage)=lower(?)"; args.append(filters["storage"])
+        sql += " order by p.created_at desc limit 100"
+        with connect() as db:
+            rows = [dict(row) for row in db.execute(sql,args)]
+        for row in rows: row.pop("evidence_snapshot", None)
+        return rows
 
     def price_suggestion(self,user:dict,device_id:str)->dict:
         with connect() as db:

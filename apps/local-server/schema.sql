@@ -207,3 +207,45 @@ create table if not exists stocktake_items (
   scanned_at text not null,
   primary key (stocktake_id, device_id)
 );
+
+create table if not exists market_quotes (
+  id text primary key,
+  shop_id text not null references shops(id),
+  source_name text not null,
+  quote_type text not null check (quote_type in ('recycle','retail')),
+  brand text not null default '',
+  model text not null,
+  storage text not null,
+  condition_grade text not null default '',
+  battery_health integer check (battery_health is null or battery_health between 0 and 100),
+  repair_status text not null default 'unknown' check (repair_status in ('original','no_repair','minor_repair','major_repair','unknown')),
+  price real not null check (price > 0),
+  captured_on text not null,
+  note text not null default '',
+  created_by text not null references users(id),
+  created_at text not null
+);
+create index if not exists market_quotes_lookup_idx on market_quotes(shop_id, model, storage, captured_on desc);
+
+create table if not exists pricing_decisions (
+  id text primary key,
+  shop_id text not null references shops(id),
+  device_id text references devices(id),
+  brand text not null default '',
+  model text not null,
+  storage text not null,
+  condition_grade text not null default '',
+  battery_health integer check (battery_health is null or battery_health between 0 and 100),
+  repair_status text not null default 'unknown' check (repair_status in ('original','no_repair','minor_repair','major_repair','unknown')),
+  suggested_purchase_low real,
+  suggested_purchase_high real,
+  suggested_sale_low real,
+  suggested_sale_high real,
+  final_purchase_price real,
+  final_sale_price real,
+  adjustment_reason text not null default '',
+  evidence_snapshot text not null default '{}',
+  created_by text not null references users(id),
+  created_at text not null
+);
+create index if not exists pricing_decisions_lookup_idx on pricing_decisions(shop_id, model, storage, created_at desc);

@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=21";
+import { LocalClient } from "./src/local-client.js?v=23";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
@@ -25,6 +25,7 @@ let scanBusy = false;
 let scanLastFrame = 0;
 let scanDetector = null;
 let ledgerRows = [];
+let marketEvidence = null;
 let toastTimer;
 let searchTimer;
 
@@ -55,6 +56,7 @@ async function loadApp() {
   user = user || await api.me();
   $("#shop-name").textContent = user.shop_name;
   $("#role-text").textContent = `${user.display_name} · ${roles[user.role]}`;
+  $("#market-button").hidden = user.role !== "owner";
   await Promise.all([refresh(), refreshSystemStatus()]);
 }
 
@@ -169,6 +171,7 @@ async function openDetail(deviceId) {
   $("#repair-device").hidden = ["sold","in_repair"].includes(detail.status);
   $("#complete-repair").hidden = !detail.repair;
   $("#return-device").hidden = detail.status !== "sold";
+  $("#suggest-price").hidden = user.role !== "owner";
   if (!$("#detail-dialog").open) $("#detail-dialog").showModal();
 }
 
@@ -320,6 +323,48 @@ $("#ledger-body").addEventListener("click",event=>{
 });
 $("#ledger-edit-form").addEventListener("submit",async event=>{event.preventDefault();$("#ledger-edit-error").textContent="";const data=Object.fromEntries(new FormData(event.currentTarget));try{await api.updateSale(data.saleId,data);$("#ledger-edit-dialog").close();await loadLedger();await refresh();toast("销售记录已更正");}catch(error){$("#ledger-edit-error").textContent=error.message;}});
 $("#ledger-print").addEventListener("click",()=>window.print());
+
+const marketRepairNames={original:"全原装",no_repair:"无拆修",minor_repair:"小修",major_repair:"大修",unknown:"未知"};
+const marketConfidenceNames={high:"较高",medium:"中等",low:"较低"};
+function marketFilters(){return Object.fromEntries(new FormData($("#market-query-form")));}
+function priceRange(value){return value?`${money(value[0])} ～ ${money(value[1])}`:"证据不足";}
+function renderMarketSummary(result){
+  const e=result.external,i=result.internal,s=result.suggestion;
+  $("#market-summary").innerHTML=`<div class="market-price-grid"><article class="market-price"><small>建议回收区间</small><strong>${priceRange(s.purchaseRange)}</strong><em>外部回收中位数 ${e.recycleMedian?money(e.recycleMedian):"—"}</em></article><article class="market-price"><small>建议销售区间</small><strong>${priceRange(s.saleRange)}</strong><em>店内成交中位数 ${i.salesMedian?money(i.salesMedian):"—"}</em></article><article class="market-price"><small>预计最低毛利</small><strong>${s.estimatedMargin===null?"—":money(s.estimatedMargin)}</strong><em>证据可信度：${marketConfidenceNames[s.confidence]}</em></article></div><section class="market-evidence"><div><b>外部参考</b><span>回收 ${e.recycleCount} 条 · 销售 ${e.retailCount} 条</span><small>${e.sources.length?e.sources.map(esc).join("、"):"尚未录入外部来源"}</small></div><div><b>门店自己的数据</b><span>成交 ${i.salesCount} 笔 · 同款库存 ${i.inventoryCount} 台</span><small>历史成本中位数 ${i.costMedian?money(i.costMedian):"—"} · 当前标价中位数 ${i.listMedian?money(i.listMedian):"—"}</small></div></section><p class="market-basis">依据：${esc(s.basis)}。${esc(result.notice)}</p>`;
+}
+function renderMarketQuotes(rows){
+  $("#market-quotes").innerHTML=rows.length?rows.map(row=>`<div class="market-row"><span><b>${esc(row.source_name)} · ${row.quote_type==="recycle"?"回收":"销售"}</b><small>${esc(row.model)} ${esc(row.storage)} · ${esc(row.condition_grade||"成色未标")} · 电池${row.battery_health??"未标"} · ${marketRepairNames[row.repair_status]||"未知"}</small><small>${esc(row.captured_on)} ${row.note?`· ${esc(row.note)}`:""}</small></span><strong>${money(row.price)}</strong><button type="button" data-delete-quote="${row.id}">删除</button></div>`).join(""):"<p class='empty-inline'>尚无匹配行情，先录入一条实际报价。</p>";
+}
+function renderPricingDecisions(rows){
+  $("#pricing-decisions").innerHTML=rows.length?rows.map(row=>`<div class="market-row"><span><b>${esc(row.model)} ${esc(row.storage)}</b><small>${new Date(row.created_at).toLocaleString("zh-CN")} · ${esc(row.creator_name)}</small><small>${esc(row.adjustment_reason||"未填写调整原因")}</small></span><strong>收 ${row.final_purchase_price===null?"—":money(row.final_purchase_price)}<br>售 ${row.final_sale_price===null?"—":money(row.final_sale_price)}</strong></div>`).join(""):"<p class='empty-inline'>还没有保存过老板定价。</p>";
+}
+async function loadMarket(){
+  const filters=marketFilters();
+  $("#market-error").textContent="";
+  const [summary,quotes,decisions]=await Promise.all([api.marketSummary(filters),api.marketQuotes(filters),api.pricingDecisions(filters)]);
+  marketEvidence=summary; renderMarketSummary(summary); renderMarketQuotes(quotes); renderPricingDecisions(decisions);
+}
+function openMarketDialog(device=null){
+  marketEvidence=null; $("#market-summary").innerHTML='<div class="empty">输入型号和容量后查询行情</div>'; $("#market-error").textContent="";
+  const form=$("#market-query-form");
+  if(device){form.elements.brand.value=device.brand||"其他";form.elements.model.value=device.model||"";form.elements.storage.value=device.storage||"";form.elements.conditionGrade.value=device.condition_grade||"";form.elements.batteryHealth.value=device.battery_health??"";form.elements.repairStatus.value="unknown";}
+  $("#market-quote-form").elements.capturedOn.value=localDay(new Date()); $("#market-dialog").showModal();
+  if(device) form.requestSubmit();
+}
+$("#market-button").addEventListener("click",()=>openMarketDialog());
+$("#market-query-form").addEventListener("submit",async event=>{event.preventDefault();$("#market-summary").innerHTML='<div class="empty">正在汇总外部行情和门店历史…</div>';try{await loadMarket();}catch(error){$("#market-error").textContent=error.message;}});
+$("#market-quote-form").addEventListener("submit",async event=>{
+  event.preventDefault(); const form=event.currentTarget; const query=$("#market-query-form"); if(!query.reportValidity())return;
+  const button=event.submitter; button.disabled=true; $("#market-error").textContent="";
+  try{await api.createMarketQuote({...marketFilters(),...Object.fromEntries(new FormData(form))});form.elements.price.value="";form.elements.note.value="";await loadMarket();toast("外部行情已保存");}catch(error){$("#market-error").textContent=error.message;}finally{button.disabled=false;}
+});
+$("#pricing-decision-form").addEventListener("submit",async event=>{
+  event.preventDefault(); const form=event.currentTarget; if(!marketEvidence){$("#market-error").textContent="请先查询一次行情，再保存最终定价";return;}
+  const button=event.submitter; button.disabled=true; $("#market-error").textContent="";
+  try{const finalData=Object.fromEntries(new FormData(form));await api.createPricingDecision({...marketFilters(),...finalData,suggestion:marketEvidence.suggestion,evidence:{external:marketEvidence.external,internal:marketEvidence.internal}});form.reset();await loadMarket();toast("老板定价已保存");}catch(error){$("#market-error").textContent=error.message;}finally{button.disabled=false;}
+});
+$("#market-quotes").addEventListener("click",async event=>{const button=event.target.closest("[data-delete-quote]");if(!button||!confirm("确认删除这条错误行情记录？"))return;button.disabled=true;try{await api.deleteMarketQuote(button.dataset.deleteQuote);await loadMarket();toast("行情记录已删除");}catch(error){$("#market-error").textContent=error.message;button.disabled=false;}});
+
 $("#smart-button").addEventListener("click",async()=>{$("#smart-dialog").showModal();$("#smart-summary").textContent="正在根据本地数据生成…";try{$("#smart-summary").textContent=(await api.smartSummary()).summary;}catch(error){$("#smart-summary").textContent=error.message;}});
 $("#voice-start").addEventListener("click",()=>{const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition;if(!Recognition){toast("当前浏览器不支持语音识别，可直接输入文字");return;}const recognition=new Recognition();recognition.lang="zh-CN";recognition.interimResults=false;recognition.onresult=event=>{$("#voice-intake-form").elements.text.value=event.results[0][0].transcript;};recognition.onerror=()=>toast("没有听清，请重试或输入文字");recognition.start();});
 $("#voice-intake-form").addEventListener("submit",async event=>{event.preventDefault();try{const parsed=await api.parseIntakeText(event.currentTarget.elements.text.value);const form=$("#intake-form");Object.entries(parsed).forEach(([key,value])=>{if(form.elements[key]&&value!==null&&value!=="")form.elements[key].value=value;});$("#smart-dialog").close();$("#intake-dialog").showModal();toast("已带入识别内容，请补充IMEI并确认");}catch(error){toast(error.message);}});
@@ -640,7 +685,7 @@ $("#cancel-reservation").addEventListener("click",async()=>{if(!confirm("确认�
 $("#repair-device").addEventListener("click",async()=>{const issue=prompt("送修问题：");if(!issue)return;const vendor=prompt("维修方（可留空）：")||"";try{await api.startRepair(currentDetail.id,{issue,vendor});toast("已登记送修");await refresh();await openDetail(currentDetail.id);}catch(error){toast(error.message);}});
 $("#complete-repair").addEventListener("click",async()=>{const cost=prompt("最终维修成本：","0")||"0";const scrap=confirm("点“确定”表示报废；点“取消”表示维修完成并恢复在库。");try{await api.completeRepair(currentDetail.id,{cost,status:scrap?"scrapped":"in_stock"});toast("维修流程已完成");await refresh();await openDetail(currentDetail.id);}catch(error){toast(error.message);}});
 $("#return-device").addEventListener("click",async()=>{const reason=prompt("退货原因：");if(!reason)return;const refundAmount=prompt("退款金额：",String(currentDetail.latestSale?.sale_price||0));if(refundAmount===null)return;const disposition=prompt("后续处理：输入 restock重新入库 / repair送修 / scrap报废","restock")||"restock";try{await api.returnDevice(currentDetail.id,{reason,refundAmount,disposition});toast("退货已登记");await refresh();await openDetail(currentDetail.id);}catch(error){toast(error.message);}});
-$("#suggest-price").addEventListener("click",async()=>{try{const r=await api.priceSuggestion(currentDetail.id);if(confirm(`建议售价：${money(r.suggestedPrice)}\n建议最低价：${money(r.minimumPrice)}\n依据：${r.basis}，库存${r.ageDays}天。\n\n点击确定把建议售价填入表单。`))$("#detail-form").elements.listPrice.value=r.suggestedPrice;}catch(error){toast(error.message);}});
+$("#suggest-price").addEventListener("click",()=>{if(!currentDetail||user.role!=="owner")return;$("#detail-dialog").close();openMarketDialog(currentDetail);});
 $("#make-sales-copy").addEventListener("click",async()=>{try{const r=await api.salesCopy(currentDetail.id);try{await navigator.clipboard.writeText(r.text);toast("销售文案已复制");}catch{prompt("复制销售文案：",r.text);}}catch(error){toast(error.message);}});
 $("#detail-photo-add").addEventListener("click",async()=>{const file=$("#detail-photo-file").files[0];if(!file){toast("请先选择照片");return;}try{await api.addPhoto(currentDetail.id,{image:await compressImage(file),description:$("#detail-photo-description").value});$("#detail-photo-file").value="";$("#detail-photo-description").value="";toast("照片已保存");await openDetail(currentDetail.id);}catch(error){toast(error.message);}});
 $("#detail-form").addEventListener("submit", async event => {

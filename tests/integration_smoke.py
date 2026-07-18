@@ -160,6 +160,20 @@ def main() -> int:
     summary = owner.call("/api/smart/daily-summary")
     check(suggestion["mode"] == "local-data" and copy["mode"] == "local-template" and summary["mode"] == "local-data", "定价、文案和经营总结均为本地模式")
 
+    quote_base = {"brand":"Apple","model":"iPhone 16 Pro Max","storage":"256GB","conditionGrade":"95新","batteryHealth":88,"repairStatus":"original","capturedOn":today}
+    first_quote = owner.call("/api/market/quotes", "POST", {**quote_base,"sourceName":"手机回收龙猫","quoteType":"recycle","price":6200,"note":"自动测试报价"}, expected=201)
+    owner.call("/api/market/quotes", "POST", {**quote_base,"sourceName":"博能二手回收","quoteType":"recycle","price":6300}, expected=201)
+    owner.call("/api/market/quotes", "POST", {**quote_base,"sourceName":"测试零售平台","quoteType":"retail","price":7350}, expected=201)
+    market_query = "model=iPhone%2016%20Pro%20Max&storage=256GB&conditionGrade=95%E6%96%B0&batteryHealth=88&repairStatus=original"
+    market = owner.call(f"/api/market/summary?{market_query}")
+    quotes = owner.call(f"/api/market/quotes?{market_query}")
+    check(market["external"]["recycleCount"] == 2 and market["external"]["recycleMedian"] == 6250 and market["external"]["retailCount"] == 1 and market["internal"]["salesCount"] == 2 and len(quotes) == 3, "外部行情与门店历史独立汇总")
+    decision = owner.call("/api/market/decisions", "POST", {**quote_base,"finalPurchasePrice":6250,"finalSalePrice":7200,"adjustmentReason":"同行竞争测试","suggestion":market["suggestion"],"evidence":{"external":market["external"],"internal":market["internal"]}}, expected=201)
+    decisions = owner.call(f"/api/market/decisions?{market_query}")
+    check(decisions[0]["id"] == decision["id"] and decisions[0]["final_purchase_price"] == 6250 and decisions[0]["final_sale_price"] == 7200, "老板最终定价独立留档")
+    owner.call(f"/api/market/quotes/{first_quote['id']}/delete", "POST", {})
+    check(len(owner.call(f"/api/market/quotes?{market_query}")) == 2, "错误行情删除")
+
     owner.call("/api/users", "POST", {"username": "staff", "displayName": "测试店员", "password": "staff123", "role": "staff"}, expected=201)
     staff = Client(args.base)
     staff.call("/api/login", "POST", {"username": "staff", "password": "staff123"})
@@ -167,6 +181,7 @@ def main() -> int:
     staff_ledger = staff.call(f"/api/ledger?date={today}")
     staff.call("/api/users", expected=403)
     staff.call(f"/api/sales/{second_sale['saleId']}/update", "POST", {"salePrice": 1}, expected=403)
+    staff.call(f"/api/market/summary?{market_query}", expected=403)
     check("purchase_cost" not in staff_detail and "imei" not in staff_detail and "profit" not in staff_ledger["summary"] and "purchase_cost_snapshot" not in staff_ledger["rows"][0] and staff_ledger["rows"][0]["imei"].startswith("••••"), "店员成本、利润与完整IMEI隔离")
 
     backup = owner.call("/api/backups/create", "POST", {})

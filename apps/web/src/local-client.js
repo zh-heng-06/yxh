@@ -39,6 +39,12 @@ export class LocalClient {
   report(from,to){const p=new URLSearchParams({from,to});return this.request(`/api/reports/summary?${p}`);}
   ledger(date){const p=new URLSearchParams({date});return this.request(`/api/ledger?${p}`);}
   updateSale(id,data){return this.request(`/api/sales/${encodeURIComponent(id)}/update`,{method:"POST",body:data});}
+  marketQuotes(filters={}){const p=new URLSearchParams(filters);return this.request(`/api/market/quotes?${p}`);}
+  createMarketQuote(data){return this.request("/api/market/quotes",{method:"POST",body:data});}
+  deleteMarketQuote(id){return this.request(`/api/market/quotes/${encodeURIComponent(id)}/delete`,{method:"POST",body:{}});}
+  marketSummary(filters){const p=new URLSearchParams(filters);return this.request(`/api/market/summary?${p}`);}
+  pricingDecisions(filters={}){const p=new URLSearchParams(filters);return this.request(`/api/market/decisions?${p}`);}
+  createPricingDecision(data){return this.request("/api/market/decisions",{method:"POST",body:data});}
   smartSummary(){return this.request("/api/smart/daily-summary");}
   parseIntakeText(text){return this.request("/api/smart/parse-intake",{method:"POST",body:{text}});}
   priceSuggestion(id){return this.request(`/api/devices/${encodeURIComponent(id)}/price-suggestion`);}
