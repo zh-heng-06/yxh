@@ -65,6 +65,7 @@ COOKIE_NAME = "zhanggui_session"
 SESSION_DAYS = 30
 PBKDF2_ROUNDS = 260_000
 WRITE_LOCK = threading.Lock()
+BACKUP_LOCK = threading.Lock()
 MARKET_FEED_LOCK = threading.Lock()
 MARKET_FEED_PAGES = {
     "5041": {"name":"博能二手回收·苹果有保", "url":"https://13994040400.huishoubaojia.com/5041.html", "minimumRows":20},
@@ -76,8 +77,18 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class StoreConnection(sqlite3.Connection):
+    """Commit or roll back like sqlite3.Connection, then release the file handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH, timeout=15)
+    db = sqlite3.connect(DB_PATH, timeout=15, factory=StoreConnection)
     db.row_factory = sqlite3.Row
     db.execute("pragma foreign_keys=on")
     db.execute("pragma busy_timeout=15000")
@@ -145,22 +156,84 @@ def database_check() -> str:
     return result
 
 
+def database_file_check(path: Path) -> str:
+    db = sqlite3.connect(path)
+    try:
+        result = db.execute("pragma quick_check").fetchone()[0]
+    finally:
+        db.close()
+    if result != "ok":
+        raise RuntimeError(f"备份数据库自检失败：{result}")
+    return result
+
+
 def daily_backup(force: bool = False) -> Path:
+    with BACKUP_LOCK:
+        backup_dir = DB_PATH.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        # Manual, scheduled and pre-restore backups can happen close together.
+        # Microseconds keep every recovery point distinct.
+        suffix = datetime.now().strftime("%Y-%m-%d-%H%M%S-%f") if force else datetime.now().strftime("%Y-%m-%d")
+        target = backup_dir / f"store-{suffix}.db"
+        if force or not target.exists():
+            source, destination = connect(), sqlite3.connect(target)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+        try:
+            database_file_check(target)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+        cutoff = datetime.now().timestamp() - 30 * 86400
+        for old in backup_dir.glob("store-*.db"):
+            if old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
+        return target
+
+
+def backup_state() -> dict:
     backup_dir = DB_PATH.parent / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    # Manual backups and the safety copy made immediately before a restore can
-    # happen within the same second.  Microseconds keep those files distinct;
-    # otherwise the safety copy could overwrite the backup being restored.
-    suffix = datetime.now().strftime("%Y-%m-%d-%H%M%S-%f") if force else datetime.now().strftime("%Y-%m-%d")
-    target = backup_dir / f"store-{suffix}.db"
-    if force or not target.exists():
-        with connect() as source, sqlite3.connect(target) as destination:
-            source.backup(destination)
-    cutoff = datetime.now().timestamp() - 30 * 86400
-    for old in backup_dir.glob("store-*.db"):
-        if old.stat().st_mtime < cutoff:
-            old.unlink(missing_ok=True)
+    backups = sorted(backup_dir.glob("store-*.db"), key=lambda item: item.stat().st_mtime, reverse=True) if backup_dir.exists() else []
+    if not backups:
+        return {"schedule": "每天19:00", "lastBackup": None, "verified": False, "status": "missing"}
+    latest = backups[0]
+    try:
+        database_file_check(latest)
+        verified, status = True, "ok"
+    except Exception:
+        verified, status = False, "invalid"
+    return {
+        "schedule": "每天19:00",
+        "lastBackup": latest.name,
+        "lastBackupAt": datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+        "size": latest.stat().st_size,
+        "verified": verified,
+        "status": status,
+    }
+
+
+def next_daily_backup_at(now: datetime | None = None) -> datetime:
+    current = now or datetime.now().astimezone()
+    target = current.replace(hour=19, minute=0, second=0, microsecond=0)
+    if target <= current:
+        target += timedelta(days=1)
     return target
+
+
+def backup_scheduler(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        current = datetime.now().astimezone()
+        target = next_daily_backup_at(current)
+        if stop_event.wait(max(1, (target - current).total_seconds())):
+            return
+        try:
+            path = daily_backup(True)
+            print(f"BACKUP_OK: {path.name}")
+        except Exception as error:
+            print(f"BACKUP_ERROR: {error}", file=sys.stderr)
 
 
 def fetch_public_market_page(page_id: str) -> dict:
@@ -501,7 +574,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.send_json(self.current_user())
             if path == "/api/status":
                 user = self.current_user()
-                return self.send_json({"database": database_check(), "printer": printer_state(), "lanUrl": self.phone_url, "backupRetentionDays": 30, "role": user["role"]})
+                return self.send_json({"database": database_check(), "printer": printer_state(), "lanUrl": self.phone_url, "backupRetentionDays": 30, "backup": backup_state(), "role": user["role"]})
             if path == "/api/backups":
                 return self.send_json(self.list_backups(self.current_user()))
             if path == "/api/users":
@@ -708,7 +781,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def create_backup(self, actor: dict) -> None:
         if actor["role"] != "owner": raise ApiError(HTTPStatus.FORBIDDEN, "只有老板可以备份")
         path = daily_backup(True)
-        self.send_json({"ok": True, "name": path.name, "size": path.stat().st_size})
+        self.send_json({"ok": True, "name": path.name, "size": path.stat().st_size, "verified": True})
 
     def restore_backup(self, actor: dict, data: dict) -> None:
         if actor["role"] != "owner": raise ApiError(HTTPStatus.FORBIDDEN, "只有老板可以恢复备份")
@@ -718,8 +791,13 @@ class StoreHandler(SimpleHTTPRequestHandler):
         backup = DB_PATH.parent / "backups" / name
         if not backup.exists(): raise ApiError(HTTPStatus.NOT_FOUND, "备份文件不存在")
         safety = daily_backup(True)
-        with WRITE_LOCK, sqlite3.connect(backup) as source, connect() as destination:
-            source.backup(destination)
+        with WRITE_LOCK:
+            source, destination = sqlite3.connect(backup), connect()
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
         database_check()
         self.send_json({"ok": True, "restored": name, "safetyBackup": safety.name})
 
@@ -1595,17 +1673,19 @@ def main() -> None:
         print("密码重置成功，请重新登录。")
         return
     server=ThreadingHTTPServer(("0.0.0.0",args.port),StoreHandler)
-    market_stop = threading.Event()
-    market_thread = None
+    service_stop = threading.Event()
+    market_thread = backup_thread = None
     if not args.db:
-        market_thread = threading.Thread(target=market_feed_scheduler,args=(market_stop,),name="market-feed",daemon=True)
+        market_thread = threading.Thread(target=market_feed_scheduler,args=(service_stop,),name="market-feed",daemon=True)
         market_thread.start()
+        backup_thread = threading.Thread(target=backup_scheduler,args=(service_stop,),name="daily-backup",daemon=True)
+        backup_thread.start()
     print(f"\n掌柜台正式局域网测试系统已启动\n电脑：http://127.0.0.1:{args.port}/\n手机：http://{lan_ip()}:{args.port}/\n")
     if args.open: threading.Timer(.8,lambda:webbrowser.open(f"http://127.0.0.1:{args.port}/")).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:
-        market_stop.set()
+        service_stop.set()
         server.server_close()
 
 

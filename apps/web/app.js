@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=26";
+import { LocalClient } from "./src/local-client.js?v=27";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
@@ -67,6 +67,12 @@ async function refreshSystemStatus() {
   $("#connection-text").textContent = status.database === "ok" ? "SQLite共享数据库正常" : "数据库需要检查";
   $("#printer-text").textContent = `打印机：${status.printer.connected ? "NIIMBOT B1 已连接" : status.printer.status}`;
   $("#system-status").textContent = `数据库：${status.database}；打印机：${status.printer.status}；手机地址：${status.lanUrl}`;
+  const backup = status.backup;
+  if (backup) {
+    const last = backup.lastBackupAt ? new Date(backup.lastBackupAt).toLocaleString("zh-CN") : "尚无备份";
+    $("#backup-policy").textContent = `${backup.schedule}自动备份；最近一次：${last}；校验：${backup.verified ? "通过" : "需要检查"}`;
+    $("#backup-policy").className = backup.verified ? "backup-ok" : "backup-warning";
+  }
 }
 
 async function renderUsers() {
@@ -414,7 +420,8 @@ $("#backup-now").addEventListener("click", async () => {
   $("#backup-status").textContent = "正在备份…";
   try {
     const result = await api.createBackup();
-    $("#backup-status").textContent = `备份完成：${result.name}`;
+    $("#backup-status").textContent = `备份完成并校验通过：${result.name}`;
+    await refreshSystemStatus();
     await renderBackups();
   } catch (error) { $("#backup-status").textContent = error.message; }
 });
