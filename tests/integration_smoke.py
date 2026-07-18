@@ -17,7 +17,7 @@ class Client:
         self.base = base.rstrip("/")
         self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
 
-    def call(self, path: str, method: str = "GET", data=None, raw: bool = False, expected: int | tuple[int, ...] = 200):
+    def call(self, path: str, method: str = "GET", data=None, raw: bool = False, expected: int | tuple[int, ...] = 200, timeout: int = 45):
         body = None if data is None else json.dumps(data, ensure_ascii=False).encode("utf-8")
         headers = {}
         if body is not None:
@@ -26,7 +26,7 @@ class Client:
             headers["X-ZhangGui-Request"] = "1"
         request = Request(self.base + path, data=body, method=method, headers=headers)
         try:
-            response = self.opener.open(request, timeout=45)
+            response = self.opener.open(request, timeout=timeout)
             status, payload = response.status, response.read()
             content_type = response.headers.get("Content-Type", "")
         except HTTPError as error:

@@ -41,6 +41,8 @@ export class LocalClient {
   updateSale(id,data){return this.request(`/api/sales/${encodeURIComponent(id)}/update`,{method:"POST",body:data});}
   marketQuotes(filters={}){const p=new URLSearchParams(filters);return this.request(`/api/market/quotes?${p}`);}
   createMarketQuote(data){return this.request("/api/market/quotes",{method:"POST",body:data});}
+  recognizeMarketSheet(data){return this.request("/api/market/sheet/recognize",{method:"POST",body:data,timeout:180000});}
+  importMarketSheet(data){return this.request("/api/market/sheet/import",{method:"POST",body:data,timeout:30000});}
   deleteMarketQuote(id){return this.request(`/api/market/quotes/${encodeURIComponent(id)}/delete`,{method:"POST",body:{}});}
   marketSummary(filters){const p=new URLSearchParams(filters);return this.request(`/api/market/summary?${p}`);}
   pricingDecisions(filters={}){const p=new URLSearchParams(filters);return this.request(`/api/market/decisions?${p}`);}

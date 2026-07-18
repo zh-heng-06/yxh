@@ -249,3 +249,17 @@ create table if not exists pricing_decisions (
   created_at text not null
 );
 create index if not exists pricing_decisions_lookup_idx on pricing_decisions(shop_id, model, storage, created_at desc);
+
+create table if not exists market_sheet_imports (
+  id text primary key,
+  shop_id text not null references shops(id),
+  source_name text not null,
+  captured_on text not null,
+  image_url text not null,
+  file_path text not null,
+  row_count integer not null default 0,
+  quote_count integer not null default 0,
+  created_by text not null references users(id),
+  created_at text not null
+);
+create index if not exists market_sheet_imports_idx on market_sheet_imports(shop_id, captured_on desc);

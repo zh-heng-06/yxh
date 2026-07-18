@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=23";
+import { LocalClient } from "./src/local-client.js?v=24";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
@@ -26,6 +26,7 @@ let scanLastFrame = 0;
 let scanDetector = null;
 let ledgerRows = [];
 let marketEvidence = null;
+let marketSheetResult = null;
 let toastTimer;
 let searchTimer;
 
@@ -338,6 +339,16 @@ function renderMarketQuotes(rows){
 function renderPricingDecisions(rows){
   $("#pricing-decisions").innerHTML=rows.length?rows.map(row=>`<div class="market-row"><span><b>${esc(row.model)} ${esc(row.storage)}</b><small>${new Date(row.created_at).toLocaleString("zh-CN")} · ${esc(row.creator_name)}</small><small>${esc(row.adjustment_reason||"未填写调整原因")}</small></span><strong>收 ${row.final_purchase_price===null?"—":money(row.final_purchase_price)}<br>售 ${row.final_sale_price===null?"—":money(row.final_sale_price)}</strong></div>`).join(""):"<p class='empty-inline'>还没有保存过老板定价。</p>";
 }
+function renderMarketSheet(result){
+  marketSheetResult=result;
+  $("#market-sheet-date").value=result.capturedOn||localDay(new Date());
+  $("#market-sheet-count").value=`${result.rowCount} 个容量 · ${result.quoteCount} 条报价`;
+  const conditions=["靓机","小花","大花","外爆","内爆可测"];
+  $("#market-sheet-body").innerHTML=result.rows.map((row,index)=>`<tr data-sheet-index="${index}"><td><input type="checkbox" data-field="include" checked aria-label="导入第${index+1}行"></td><td><input data-field="model" value="${esc(row.model)}"></td><td><input data-field="storage" value="${esc(row.storage)}"></td>${conditions.map(condition=>`<td><input data-condition="${condition}" type="number" min="0" value="${row.prices[condition]??""}"></td>`).join("")}</tr>`).join("");
+  $("#market-sheet-preview").hidden=false;
+  $("#market-sheet-status").className="ocr-status done";
+  $("#market-sheet-status").textContent=`识别完成：${result.rowCount}个容量、${result.quoteCount}条分档报价。请检查后确认导入。`;
+}
 async function loadMarket(){
   const filters=marketFilters();
   $("#market-error").textContent="";
@@ -352,6 +363,19 @@ function openMarketDialog(device=null){
   if(device) form.requestSubmit();
 }
 $("#market-button").addEventListener("click",()=>openMarketDialog());
+$("#market-sheet-form").addEventListener("submit",async event=>{
+  event.preventDefault(); const form=event.currentTarget; const button=event.submitter; button.disabled=true; $("#market-error").textContent=""; $("#market-sheet-status").className="ocr-status working"; $("#market-sheet-status").textContent="正在下载并分段识别长报价表，通常需要约1分钟…";
+  try{const result=await api.recognizeMarketSheet(Object.fromEntries(new FormData(form)));renderMarketSheet(result);}catch(error){$("#market-sheet-status").className="ocr-status";$("#market-sheet-status").textContent=error.message;}finally{button.disabled=false;}
+});
+$("#market-sheet-body").addEventListener("change",event=>{const checkbox=event.target.closest('[data-field="include"]');if(checkbox)checkbox.closest("tr").classList.toggle("skipped",!checkbox.checked);});
+$("#market-sheet-cancel").addEventListener("click",()=>{marketSheetResult=null;$("#market-sheet-preview").hidden=true;$("#market-sheet-status").className="ocr-status";$("#market-sheet-status").textContent="本次识别已取消，没有写入行情库。";});
+$("#market-sheet-import").addEventListener("click",async event=>{
+  if(!marketSheetResult)return; const conditions=["靓机","小花","大花","外爆","内爆可测"]; const selected=[];
+  document.querySelectorAll("#market-sheet-body tr").forEach(tr=>{if(!tr.querySelector('[data-field="include"]').checked)return;const original=marketSheetResult.rows[Number(tr.dataset.sheetIndex)];const prices={};conditions.forEach(condition=>{const value=tr.querySelector(`[data-condition="${condition}"]`).value;if(value!=="")prices[condition]=Number(value);});selected.push({...original,model:tr.querySelector('[data-field="model"]').value.trim(),storage:tr.querySelector('[data-field="storage"]').value.trim(),prices});});
+  if(!selected.length){$("#market-error").textContent="请至少勾选一行报价";return;} if(!confirm(`确认把选中的${selected.length}个容量、最多${selected.length*5}条行情写入本地数据库？`))return;
+  const button=event.currentTarget;button.disabled=true;$("#market-error").textContent="";
+  try{const result=await api.importMarketSheet({sourceName:marketSheetResult.sourceName,imageUrl:marketSheetResult.imageUrl,sheetRef:marketSheetResult.sheetRef,capturedOn:$("#market-sheet-date").value,rows:selected});$("#market-sheet-preview").hidden=true;marketSheetResult=null;$("#market-sheet-status").className="ocr-status done";$("#market-sheet-status").textContent=`批量导入完成：新增${result.imported}条，跳过重复${result.skipped}条。`;toast("整张报价表已导入行情库");}catch(error){$("#market-error").textContent=error.message;}finally{button.disabled=false;}
+});
 $("#market-query-form").addEventListener("submit",async event=>{event.preventDefault();$("#market-summary").innerHTML='<div class="empty">正在汇总外部行情和门店历史…</div>';try{await loadMarket();}catch(error){$("#market-error").textContent=error.message;}});
 $("#market-quote-form").addEventListener("submit",async event=>{
   event.preventDefault(); const form=event.currentTarget; const query=$("#market-query-form"); if(!query.reportValidity())return;

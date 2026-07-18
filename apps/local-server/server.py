@@ -25,6 +25,7 @@ from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT.parent / "web"
@@ -54,6 +55,10 @@ try:
     from ocr_intake import recognize_device_screenshot
 except ImportError:
     recognize_device_screenshot = None
+try:
+    from market_ocr import recognize_market_sheet
+except ImportError:
+    recognize_market_sheet = None
 
 COOKIE_NAME = "zhanggui_session"
 SESSION_DAYS = 30
@@ -120,6 +125,8 @@ def migrate_db() -> None:
             db.execute("insert into schema_migrations(version,applied_at) values(2,?)", (now_iso(),))
         if 3 not in applied:
             db.execute("insert into schema_migrations(version,applied_at) values(3,?)", (now_iso(),))
+        if 4 not in applied:
+            db.execute("insert into schema_migrations(version,applied_at) values(4,?)", (now_iso(),))
 
 
 def database_check() -> str:
@@ -271,7 +278,12 @@ class StoreHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         if cookie: self.send_header("Set-Cookie", cookie)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # 手机切换网络或浏览器超时后，OCR等本地任务可能刚好完成。
+            # 客户端已经离开时无需再次向断开的连接写错误响应。
+            return
 
     def read_json(self, max_bytes=1_000_000) -> dict:
         try:
@@ -388,6 +400,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.send_json(self.parse_intake_text(self.current_user(), self.read_json()))
             if path == "/api/market/quotes":
                 return self.create_market_quote(self.current_user(), self.read_json())
+            if path == "/api/market/sheet/recognize":
+                return self.recognize_market_sheet_url(self.current_user(), self.read_json())
+            if path == "/api/market/sheet/import":
+                return self.import_market_sheet(self.current_user(), self.read_json(5_000_000))
             if path.startswith("/api/market/quotes/") and path.endswith("/delete"):
                 return self.delete_market_quote(self.current_user(), path.split("/")[4])
             if path == "/api/market/decisions":
@@ -1001,6 +1017,101 @@ class StoreHandler(SimpleHTTPRequestHandler):
         with connect() as db:
             return [dict(row) for row in db.execute(sql, args)]
 
+    def recognize_market_sheet_url(self, user: dict, data: dict) -> None:
+        self.require_market_owner(user)
+        if recognize_market_sheet is None:
+            raise ApiError(HTTPStatus.NOT_IMPLEMENTED, "本地报价表识别组件没有安装")
+        image_url = str(data.get("imageUrl", "")).strip()
+        source_name = str(data.get("sourceName", "")).strip()
+        parsed = urlparse(image_url)
+        allowed_hosts = {"cos.huishoubaojiadan.com"}
+        if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "当前仅允许导入已确认的回收报价单图片域名")
+        try:
+            request = Request(image_url, headers={"User-Agent":"Mozilla/5.0 ZhangGui/1.0","Accept":"image/png,image/jpeg,image/webp"})
+            with urlopen(request, timeout=25) as response:
+                final_url = response.geturl()
+                if urlparse(final_url).scheme != "https" or urlparse(final_url).hostname not in allowed_hosts:
+                    raise ValueError("报价图片跳转到了未允许的地址")
+                content_type = response.headers.get_content_type()
+                body = response.read(15_000_001)
+        except Exception as error:
+            raise ApiError(HTTPStatus.BAD_GATEWAY, f"报价图片下载失败：{str(error)[:80]}")
+        if len(body) > 15_000_000 or len(body) < 1_000 or content_type not in ("image/png","image/jpeg","image/webp"):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "报价图片格式或大小不正确")
+        if body.startswith(b"\x89PNG"):
+            suffix = ".png"
+        elif body.startswith(b"\xff\xd8"):
+            suffix = ".jpg"
+        elif body.startswith(b"RIFF") and body[8:12] == b"WEBP":
+            suffix = ".webp"
+        else:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "链接返回的不是支持的报价图片")
+        directory = DB_PATH.parent / "market-sheets"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{uuid.uuid4()}{suffix}"
+        path.write_bytes(body)
+        try:
+            result = recognize_market_sheet(path)
+        except ValueError as error:
+            path.unlink(missing_ok=True)
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error))
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "报价表本地识别失败，请换一张清晰原图")
+        if not result.get("capturedOn"):
+            timestamp = parse_qs(parsed.query).get("ts", [""])[0]
+            if re.match(r"^20\d{6}", timestamp):
+                result["capturedOn"] = f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
+        result.update({"sourceName":source_name or "外部报价表","imageUrl":image_url,"sheetRef":str(path.relative_to(DB_PATH.parent)).replace("\\","/")})
+        self.send_json(result)
+
+    def import_market_sheet(self, user: dict, data: dict) -> None:
+        self.require_market_owner(user)
+        source_name = str(data.get("sourceName", "")).strip()
+        image_url = str(data.get("imageUrl", "")).strip()
+        sheet_ref = str(data.get("sheetRef", "")).strip().replace("\\", "/")
+        rows = data.get("rows")
+        try:
+            captured_on = datetime.strptime(str(data.get("capturedOn", "")), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "报价日期不正确")
+        if not source_name or not isinstance(rows, list) or not rows or len(rows) > 200:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "报价表来源或识别行不正确")
+        if not re.fullmatch(r"market-sheets/[0-9a-f-]{36}\.(?:png|jpg|webp)", sheet_ref, re.I):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "报价表原图引用不正确")
+        sheet_path = (DB_PATH.parent / sheet_ref).resolve()
+        sheet_directory = (DB_PATH.parent / "market-sheets").resolve()
+        if sheet_path.parent != sheet_directory or not sheet_path.is_file():
+            raise ApiError(HTTPStatus.BAD_REQUEST, "报价表原图不存在")
+        quote_rows = []
+        allowed_conditions = {item[2] for item in ((240,315,"靓机"),(315,387,"小花"),(387,459,"大花"),(459,532,"外爆"),(532,610,"内爆可测"))}
+        for row in rows:
+            if not isinstance(row, dict): continue
+            model, storage = str(row.get("model", "")).strip(), str(row.get("storage", "")).strip().upper()
+            prices = row.get("prices") if isinstance(row.get("prices"), dict) else {}
+            if not model or not storage: continue
+            for condition, raw_price in prices.items():
+                condition = str(condition).strip()
+                try: price = float(raw_price)
+                except (TypeError, ValueError): continue
+                if condition in allowed_conditions and 50 <= price <= 50000:
+                    quote_rows.append((model,storage,condition,price,str(row.get("networkModel", "")).strip()))
+        if not quote_rows or len(quote_rows) > 1000:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "没有可导入的有效报价")
+        stamp, imported, skipped = now_iso(), 0, 0
+        with WRITE_LOCK, connect() as db:
+            db.execute("begin immediate")
+            for model,storage,condition,price,network_model in quote_rows:
+                exists = db.execute("""select 1 from market_quotes where shop_id=? and source_name=? and quote_type='recycle' and lower(model)=lower(?) and lower(storage)=lower(?) and condition_grade=? and price=? and captured_on=? limit 1""",(user["shop_id"],source_name,model,storage,condition,price,captured_on)).fetchone()
+                if exists:
+                    skipped += 1; continue
+                note = "报价表批量导入" + (f" · 网络型号{network_model}" if network_model else "")
+                db.execute("""insert into market_quotes(id,shop_id,source_name,quote_type,brand,model,storage,condition_grade,battery_health,repair_status,price,captured_on,note,created_by,created_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(str(uuid.uuid4()),user["shop_id"],source_name,"recycle","Apple",model,storage,condition,None,"unknown",price,captured_on,note,user["id"],stamp))
+                imported += 1
+            db.execute("""insert into market_sheet_imports(id,shop_id,source_name,captured_on,image_url,file_path,row_count,quote_count,created_by,created_at) values(?,?,?,?,?,?,?,?,?,?)""",(str(uuid.uuid4()),user["shop_id"],source_name,captured_on,image_url,sheet_ref,len(rows),imported,user["id"],stamp))
+        self.send_json({"ok":True,"imported":imported,"skipped":skipped,"rowCount":len(rows)},HTTPStatus.CREATED)
+
     def create_market_quote(self, user: dict, data: dict) -> None:
         self.require_market_owner(user)
         source = str(data.get("sourceName", "")).strip()
@@ -1046,7 +1157,18 @@ class StoreHandler(SimpleHTTPRequestHandler):
         if storage:
             quote_sql += " and lower(storage)=lower(?)"; quote_args.append(storage)
         if filters["conditionGrade"]:
-            quote_sql += " and (condition_grade=? or condition_grade='')"; quote_args.append(filters["conditionGrade"])
+            # Store the source's wording unchanged, but let the shop's familiar
+            # condition grades match the closest tier in a recycle quote sheet.
+            sheet_grade = {
+                "全新": "靓机", "99新": "靓机", "95新": "靓机",
+                "9成新": "小花", "8成新": "大花",
+            }.get(filters["conditionGrade"])
+            if sheet_grade:
+                quote_sql += " and (condition_grade in (?,?) or condition_grade='')"
+                quote_args.extend((filters["conditionGrade"], sheet_grade))
+            else:
+                quote_sql += " and (condition_grade=? or condition_grade='')"
+                quote_args.append(filters["conditionGrade"])
         if filters["batteryHealth"]:
             try: battery = int(filters["batteryHealth"])
             except ValueError: raise ApiError(HTTPStatus.BAD_REQUEST, "电池健康格式不正确")

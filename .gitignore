@@ -8,7 +8,12 @@ dist/
 # 门店真实数据、截图、照片、备份和运行日志禁止上传
 apps/local-server/data/
 apps/local-server/test-data/
-tmp-*/
+tmp-*
+device-photos/
+label-previews/
+market-sheets/
+source-screenshots/
+stock-qrcodes/
 docs/acceptance/
 *.db
 *.db-shm
