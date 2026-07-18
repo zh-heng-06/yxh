@@ -49,13 +49,11 @@ export class LocalClient {
   marketSummary(filters){const p=new URLSearchParams(filters);return this.request(`/api/market/summary?${p}`);}
   pricingDecisions(filters={}){const p=new URLSearchParams(filters);return this.request(`/api/market/decisions?${p}`);}
   createPricingDecision(data){return this.request("/api/market/decisions",{method:"POST",body:data});}
-  smartSummary(){return this.request("/api/smart/daily-summary");}
-  parseIntakeText(text){return this.request("/api/smart/parse-intake",{method:"POST",body:{text}});}
   priceSuggestion(id){return this.request(`/api/devices/${encodeURIComponent(id)}/price-suggestion`);}
   salesCopy(id){return this.request(`/api/devices/${encodeURIComponent(id)}/sales-copy`);}
   addPhoto(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/photos`,{method:"POST",body:data});}
   importCsv(csv){return this.request("/api/import/devices.csv",{method:"POST",body:{csv}});}
-  devices(query="",status=""){const p=new URLSearchParams();if(query)p.set("q",query);if(status)p.set("status",status);return this.request(`/api/devices?${p}`);}
+  devices(query="",scope="today_intake"){const p=new URLSearchParams();if(query)p.set("q",query);if(scope)p.set("scope",scope);return this.request(`/api/devices?${p}`);}
   device(id){return this.request(`/api/devices/${encodeURIComponent(id)}`);}
   updateDevice(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/update`,{method:"POST",body:data});}
   changeStatus(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/status`,{method:"POST",body:data});}
@@ -64,10 +62,6 @@ export class LocalClient {
   startRepair(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/repair/start`,{method:"POST",body:data});}
   completeRepair(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/repair/complete`,{method:"POST",body:data});}
   returnDevice(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/return`,{method:"POST",body:data});}
-  stocktake(){return this.request("/api/stocktakes/current");}
-  startStocktake(data){return this.request("/api/stocktakes/start",{method:"POST",body:data});}
-  scanStocktake(id,code){return this.request(`/api/stocktakes/${encodeURIComponent(id)}/scan`,{method:"POST",body:{code}});}
-  completeStocktake(id){return this.request(`/api/stocktakes/${encodeURIComponent(id)}/complete`,{method:"POST",body:{}});}
   recognizeQr(image){return this.request("/api/scan/recognize",{method:"POST",body:{image}});}
   recognizeScreenshot(image){return this.request("/api/devices/screenshot/recognize",{method:"POST",body:{image},timeout:60000});}
   intake(data){return this.request("/api/devices/intake",{method:"POST",body:data});}

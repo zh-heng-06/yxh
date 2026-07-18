@@ -726,10 +726,14 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def dashboard(self, user: dict) -> dict:
         with connect() as db:
             active = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status in ('in_stock','reserved','sold_pending_pickup')", (user["shop_id"],)).fetchone()[0]
+            today_intake = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and date(created_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()[0]
+            reserved = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status='reserved'", (user["shop_id"],)).fetchone()[0]
+            pending_pickup = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status='sold_pending_pickup'", (user["shop_id"],)).fetchone()[0]
+            unprinted = db.execute("select count(*) from devices d where d.shop_id=? and d.deleted_at is null and d.status in ('in_stock','reserved','sold_pending_pickup') and not exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed')", (user["shop_id"],)).fetchone()[0]
             aged = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status in ('in_stock','reserved') and julianday('now')-julianday(created_at)>30", (user["shop_id"],)).fetchone()[0]
             sold = db.execute("select count(*),coalesce(sum(sale_price),0) from sales where shop_id=? and date(sold_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()
             returned = db.execute("select count(*),coalesce(sum(refund_amount),0) from returns where shop_id=? and date(created_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()
-            result = {"activeCount": active, "agedCount": aged, "todaySold": max(0,sold[0]-returned[0]), "todayRevenue": sold[1]-returned[1], "role": user["role"]}
+            result = {"activeCount": active, "todayIntake": today_intake, "reservedCount": reserved, "pendingPickupCount": pending_pickup, "unprintedCount": unprinted, "agedCount": aged, "todaySold": max(0,sold[0]-returned[0]), "todayRevenue": sold[1]-returned[1], "role": user["role"]}
             if user["role"] == "owner":
                 result["inventoryCost"] = db.execute("select coalesce(sum(f.purchase_cost),0) from devices d join device_financials f on f.device_id=d.id where d.shop_id=? and d.deleted_at is null and d.status in ('in_stock','reserved','sold_pending_pickup')", (user["shop_id"],)).fetchone()[0]
                 gross = db.execute("select coalesce(sum(s.sale_price-s.purchase_cost_snapshot),0) from sales s where s.shop_id=? and date(s.sold_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()[0]
@@ -779,10 +783,18 @@ class StoreHandler(SimpleHTTPRequestHandler):
         self.send_json({"value": value})
 
     def list_devices(self, user: dict) -> list[dict]:
-        query = parse_qs(urlparse(self.path).query); text = query.get("q", [""])[0].strip(); status = query.get("status", [""])[0]
-        sql = "select d.*,(select p.status from print_jobs p where p.device_id=d.id order by p.requested_at desc limit 1) print_status" + (",f.purchase_cost,f.minimum_price" if user["role"] == "owner" else "") + " from devices d" + (" left join device_financials f on f.device_id=d.id" if user["role"] == "owner" else "") + " where d.shop_id=? and d.deleted_at is null"
+        query = parse_qs(urlparse(self.path).query); text = query.get("q", [""])[0].strip(); status = query.get("status", [""])[0]; scope = query.get("scope", [""])[0]
+        print_status_sql = "case when exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed') then 'printed' else (select p.status from print_jobs p where p.device_id=d.id order by p.requested_at desc limit 1) end print_status"
+        sql = "select d.*," + print_status_sql + (",f.purchase_cost,f.minimum_price" if user["role"] == "owner" else "") + " from devices d" + (" left join device_financials f on f.device_id=d.id" if user["role"] == "owner" else "") + " where d.shop_id=? and d.deleted_at is null"
         args = [user["shop_id"]]
         if status: sql += " and d.status=?"; args.append(status)
+        elif scope == "today_intake": sql += " and date(d.created_at,'localtime')=date('now','localtime')"
+        elif scope == "today_sold": sql += " and d.status='sold' and exists(select 1 from sales s where s.device_id=d.id and date(s.sold_at,'localtime')=date('now','localtime'))"
+        elif scope == "reserved": sql += " and d.status='reserved'"
+        elif scope == "pending_pickup": sql += " and d.status='sold_pending_pickup'"
+        elif scope == "in_stock": sql += " and d.status='in_stock'"
+        elif scope == "unprinted": sql += " and d.status in ('in_stock','reserved','sold_pending_pickup') and not exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed')"
+        elif scope == "aged": sql += " and d.status in ('in_stock','reserved') and julianday('now')-julianday(d.created_at)>30"
         if text: sql += " and (d.stock_code like ? or d.model like ? or d.imei like ? or d.serial_number like ?)"; args.extend([f"%{text}%"]*4)
         sql += " order by d.created_at desc limit 500"
         with connect() as db: rows = [dict(row) for row in db.execute(sql, args)]
@@ -799,6 +811,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             row = db.execute(sql, (device_id, user["shop_id"])).fetchone()
             if not row: raise ApiError(HTTPStatus.NOT_FOUND, "没有找到设备")
             result = dict(row)
+            result["print_status"] = "printed" if db.execute("select exists(select 1 from print_jobs where device_id=? and status='printed')", (device_id,)).fetchone()[0] else None
             result["events"] = [dict(item) for item in db.execute("select e.*,u.display_name actor_name from inventory_events e join users u on u.id=e.actor_id where e.device_id=? order by e.created_at desc,e.id desc limit 100", (device_id,))]
             result["photos"] = [dict(item) for item in db.execute("select id,photo_type,description,created_at from device_photos where device_id=? order by created_at", (device_id,))]
             reservation = db.execute("select * from reservations where device_id=? and status='active' order by created_at desc limit 1", (device_id,)).fetchone()

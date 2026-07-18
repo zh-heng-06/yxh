@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=25";
+import { LocalClient } from "./src/local-client.js?v=26";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
@@ -9,13 +9,14 @@ const statusNames = {
   sold: "已售", in_repair: "送修中", borrowed_for_test: "借出测试",
   peer_transfer: "同行调拨", return_processing: "退货处理中", scrapped: "报废"
 };
+const scopeNames = {today_intake:"今日入库",today_sold:"今日出库 / 已售",reserved:"预订中",pending_pickup:"已售待取",in_stock:"在库手机",unprinted:"待打印标签",aged:"超30天库存",all:"全部库存"};
 const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
 }[char]));
 
 let user = null;
 let devices = [];
-let statusFilter = "";
+let listScope = "today_intake";
 let recognizedScreenshot = null;
 let currentDetail = null;
 let scanCandidate = null;
@@ -81,20 +82,27 @@ async function renderBackups() {
 }
 
 async function refresh() {
+  const search = $("#search").value.trim();
   const [dash, list] = await Promise.all([
     api.dashboard(),
-    api.devices($("#search").value.trim(), statusFilter)
+    api.devices(search, search ? "all" : listScope)
   ]);
   devices = list;
+  $("#list-title").textContent = search ? "搜索结果" : (scopeNames[listScope] || "手机库存");
   $("#active-count").textContent = `${dash.activeCount} 台`;
   $("#aged-count").textContent = dash.agedCount;
+  $("#today-intake").textContent = dash.todayIntake;
   $("#today-sold").textContent = dash.todaySold;
+  $("#reserved-count").textContent = dash.reservedCount;
+  $("#pending-pickup-count").textContent = dash.pendingPickupCount;
+  $("#unprinted-count").textContent = dash.unprintedCount;
   $("#inventory-cost").textContent = user.role === "owner" ? `库存成本 ${money(dash.inventoryCost)}` : "成本仅老板可见";
-  $("#today-profit").textContent = user.role === "owner" ? money(dash.todayProfit) : "老板可见";
+  $("#today-profit").textContent = user.role === "owner" ? `今日毛利 ${money(dash.todayProfit)}` : "今日毛利仅老板可见";
   render();
 }
 
 function render() {
+  const emptyMessage = $("#search").value.trim() ? "没有找到匹配设备" : ({today_intake:"今天还没有入库",today_sold:"今天还没有出库",reserved:"当前没有预订设备",pending_pickup:"当前没有已售待取设备",in_stock:"当前没有在库设备",unprinted:"当前没有待打印标签",aged:"当前没有超30天库存"}[listScope] || "没有库存设备");
   $("#device-list").innerHTML = devices.length ? devices.map(device => `
     <article class="device" data-id="${device.id}">
       <div class="device-main">
@@ -114,9 +122,9 @@ function render() {
       <div class="device-actions">
         <button data-action="detail">详情</button>
         <button data-action="sell" ${["sold", "scrapped"].includes(device.status) ? "disabled" : ""}>出库</button>
-        <button class="print-button" data-action="print">打印标签</button>
+        ${device.print_status === "printed" ? "" : `<button class="print-button" data-action="print">打印标签</button>`}
       </div>
-    </article>`).join("") : `<div class="empty">没有找到设备</div>`;
+    </article>`).join("") : `<div class="empty">${emptyMessage}</div>`;
 }
 
 async function printLabel(deviceId, button) {
@@ -172,7 +180,8 @@ async function openDetail(deviceId) {
   $("#repair-device").hidden = ["sold","in_repair"].includes(detail.status);
   $("#complete-repair").hidden = !detail.repair;
   $("#return-device").hidden = detail.status !== "sold";
-  $("#suggest-price").hidden = user.role !== "owner";
+  $("#suggest-price").hidden = true;
+  $("#detail-print").hidden = detail.print_status === "printed";
   if (!$("#detail-dialog").open) $("#detail-dialog").showModal();
 }
 
@@ -370,7 +379,6 @@ function openMarketDialog(device=null){
   loadMarketFeedStatus().catch(error=>{$("#market-feed-summary").textContent=error.message;});
   if(device) form.requestSubmit();
 }
-$("#market-button").addEventListener("click",()=>openMarketDialog());
 $("#market-feed-pages").addEventListener("click",async event=>{const button=event.target.closest("[data-feed-sync]");if(!button)return;button.disabled=true;button.textContent="同步中…";$("#market-error").textContent="";try{const result=await api.syncMarketFeed(button.dataset.feedSync);toast(`${result.sourceName}：${result.message}`);await loadMarketFeedStatus();}catch(error){$("#market-error").textContent=error.message;await loadMarketFeedStatus().catch(()=>{});}finally{button.disabled=false;button.textContent="立即同步";}});
 $("#market-sheet-form").addEventListener("submit",async event=>{
   event.preventDefault(); const form=event.currentTarget; const button=event.submitter; button.disabled=true; $("#market-error").textContent=""; $("#market-sheet-status").className="ocr-status working"; $("#market-sheet-status").textContent="正在下载、按表格线识别并校验长报价表，通常需要1至3分钟…";
@@ -398,9 +406,6 @@ $("#pricing-decision-form").addEventListener("submit",async event=>{
 });
 $("#market-quotes").addEventListener("click",async event=>{const button=event.target.closest("[data-delete-quote]");if(!button||!confirm("确认删除这条错误行情记录？"))return;button.disabled=true;try{await api.deleteMarketQuote(button.dataset.deleteQuote);await loadMarket();toast("行情记录已删除");}catch(error){$("#market-error").textContent=error.message;button.disabled=false;}});
 
-$("#smart-button").addEventListener("click",async()=>{$("#smart-dialog").showModal();$("#smart-summary").textContent="正在根据本地数据生成…";try{$("#smart-summary").textContent=(await api.smartSummary()).summary;}catch(error){$("#smart-summary").textContent=error.message;}});
-$("#voice-start").addEventListener("click",()=>{const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition;if(!Recognition){toast("当前浏览器不支持语音识别，可直接输入文字");return;}const recognition=new Recognition();recognition.lang="zh-CN";recognition.interimResults=false;recognition.onresult=event=>{$("#voice-intake-form").elements.text.value=event.results[0][0].transcript;};recognition.onerror=()=>toast("没有听清，请重试或输入文字");recognition.start();});
-$("#voice-intake-form").addEventListener("submit",async event=>{event.preventDefault();try{const parsed=await api.parseIntakeText(event.currentTarget.elements.text.value);const form=$("#intake-form");Object.entries(parsed).forEach(([key,value])=>{if(form.elements[key]&&value!==null&&value!=="")form.elements[key].value=value;});$("#smart-dialog").close();$("#intake-dialog").showModal();toast("已带入识别内容，请补充IMEI并确认");}catch(error){toast(error.message);}});
 $("#report-form").addEventListener("submit",async event=>{
   event.preventDefault(); const d=Object.fromEntries(new FormData(event.currentTarget));
   try{const r=await api.report(d.from,d.to);$("#report-result").innerHTML=`<div class="report-metrics"><article><small>售出</small><strong>${r.soldCount}台</strong></article><article><small>销售额</small><strong>${money(r.revenue)}</strong></article><article><small>退款</small><strong>${money(r.refundAmount)}</strong></article><article><small>净销售额</small><strong>${money(r.netRevenue)}</strong></article>${user.role==="owner"?`<article><small>净利润</small><strong>${money(r.netProfit)}</strong></article><article><small>库存成本</small><strong>${money(r.inventoryCost)}</strong></article>`:""}</div><section class="settings-block"><strong>库存老化</strong>${r.aging.map(x=>`<div class="user-row"><span>${esc(x.bucket)}</span><b>${x.count}台</b></div>`).join("")}</section><section class="settings-block"><strong>型号销量</strong>${r.models.map(x=>`<div class="user-row"><span>${esc(x.model)} ${esc(x.storage)}</span><b>${x.count}台 · ${money(x.revenue)}</b></div>`).join("")||"暂无销售"}</section><section class="settings-block"><strong>店员业绩</strong>${r.staff.map(x=>`<div class="user-row"><span>${esc(x.display_name)}</span><b>${x.sold_count}台 · ${money(x.revenue)}</b></div>`).join("")||"暂无销售"}</section>`;}catch(error){$("#report-result").textContent=error.message;}
@@ -682,10 +687,11 @@ document.addEventListener("click", event => {
   }
   const close = event.target.closest("[data-close]");
   if (close) $(`#${close.dataset.close}`).close();
-  const filter = event.target.closest("[data-status]");
+  const filter = event.target.closest("[data-scope]");
   if (filter) {
-    statusFilter = filter.dataset.status;
-    document.querySelectorAll("[data-status]").forEach(item => item.classList.toggle("active", item === filter));
+    listScope = filter.dataset.scope;
+    $("#list-title").textContent = scopeNames[listScope] || "手机库存";
+    document.querySelectorAll("[data-scope]").forEach(item => item.classList.toggle("active", item.dataset.scope === listScope));
     refresh().catch(error => toast(error.message));
   }
 });
@@ -718,7 +724,6 @@ $("#cancel-reservation").addEventListener("click",async()=>{if(!confirm("确认�
 $("#repair-device").addEventListener("click",async()=>{const issue=prompt("送修问题：");if(!issue)return;const vendor=prompt("维修方（可留空）：")||"";try{await api.startRepair(currentDetail.id,{issue,vendor});toast("已登记送修");await refresh();await openDetail(currentDetail.id);}catch(error){toast(error.message);}});
 $("#complete-repair").addEventListener("click",async()=>{const cost=prompt("最终维修成本：","0")||"0";const scrap=confirm("点“确定”表示报废；点“取消”表示维修完成并恢复在库。");try{await api.completeRepair(currentDetail.id,{cost,status:scrap?"scrapped":"in_stock"});toast("维修流程已完成");await refresh();await openDetail(currentDetail.id);}catch(error){toast(error.message);}});
 $("#return-device").addEventListener("click",async()=>{const reason=prompt("退货原因：");if(!reason)return;const refundAmount=prompt("退款金额：",String(currentDetail.latestSale?.sale_price||0));if(refundAmount===null)return;const disposition=prompt("后续处理：输入 restock重新入库 / repair送修 / scrap报废","restock")||"restock";try{await api.returnDevice(currentDetail.id,{reason,refundAmount,disposition});toast("退货已登记");await refresh();await openDetail(currentDetail.id);}catch(error){toast(error.message);}});
-$("#suggest-price").addEventListener("click",()=>{if(!currentDetail||user.role!=="owner")return;$("#detail-dialog").close();openMarketDialog(currentDetail);});
 $("#make-sales-copy").addEventListener("click",async()=>{try{const r=await api.salesCopy(currentDetail.id);try{await navigator.clipboard.writeText(r.text);toast("销售文案已复制");}catch{prompt("复制销售文案：",r.text);}}catch(error){toast(error.message);}});
 $("#detail-photo-add").addEventListener("click",async()=>{const file=$("#detail-photo-file").files[0];if(!file){toast("请先选择照片");return;}try{await api.addPhoto(currentDetail.id,{image:await compressImage(file),description:$("#detail-photo-description").value});$("#detail-photo-file").value="";$("#detail-photo-description").value="";toast("照片已保存");await openDetail(currentDetail.id);}catch(error){toast(error.message);}});
 $("#detail-form").addEventListener("submit", async event => {
@@ -730,21 +735,6 @@ $("#detail-form").addEventListener("submit", async event => {
     toast("设备资料已保存"); await refresh(); await openDetail(currentDetail.id);
   } catch(error){ $("#detail-error").textContent=error.message; }
 });
-
-async function refreshStocktake(){
-  const take=await api.stocktake();
-  $("#stocktake-start").hidden=take.open; $("#stocktake-scan").hidden=!take.open;
-  if(!take.open){$("#stocktake-summary").innerHTML="<strong>当前没有进行中的盘点</strong>";$("#stocktake-missing").innerHTML="";return;}
-  $("#stocktake-dialog").dataset.id=take.id;
-  $("#stocktake-summary").innerHTML=`<strong>${esc(take.area||"全部区域")}</strong><p>应盘 ${take.expected} 台，已盘 ${take.scanned} 台，未盘 ${take.missing.length} 台</p>`;
-  $("#stocktake-missing").innerHTML=take.missing.length?`<section class="settings-block"><strong>未扫描设备</strong>${take.missing.map(item=>`<div class="user-row"><span>${esc(item.stock_code)} · ${esc(item.model)} ${esc(item.storage)}</span><span>${esc(item.area)}</span></div>`).join("")}</section>`:"";
-  $("#stocktake-scan").elements.code.focus();
-}
-$("#stocktake-button").addEventListener("click",async()=>{$("#stocktake-dialog").showModal();try{await refreshStocktake();}catch(error){toast(error.message);}});
-$("#stocktake-start").addEventListener("submit",async event=>{event.preventDefault();try{await api.startStocktake(Object.fromEntries(new FormData(event.currentTarget)));await refreshStocktake();}catch(error){toast(error.message);}});
-$("#stocktake-file").addEventListener("change",async event=>{const file=event.target.files[0];if(!file)return;try{const result=await api.recognizeQr(await compressImage(file));$("#stocktake-scan").elements.code.value=result.value;$("#stocktake-scan").requestSubmit();event.target.value="";}catch(error){$("#stocktake-message").textContent=error.message;}});
-$("#stocktake-scan").addEventListener("submit",async event=>{event.preventDefault();const input=event.currentTarget.elements.code,code=input.value.trim();if(!code)return;try{const result=await api.scanStocktake($("#stocktake-dialog").dataset.id,code);$("#stocktake-message").textContent=result.duplicate?`重复：${result.device.stockCode}`:`已盘：${result.device.stockCode} ${result.device.model}`;if(navigator.vibrate)navigator.vibrate(result.duplicate?[60,40,60]:80);input.value="";await refreshStocktake();}catch(error){$("#stocktake-message").textContent=error.message;if(navigator.vibrate)navigator.vibrate([120,60,120]);}});
-$("#stocktake-complete").addEventListener("click",async()=>{if(!confirm("确认完成盘点？未扫描清单会保留在记录中。"))return;try{await api.completeStocktake($("#stocktake-dialog").dataset.id);toast("盘点已完成");await refreshStocktake();}catch(error){toast(error.message);}});
 
 $("#intake-form").addEventListener("submit", async event => {
   event.preventDefault();
