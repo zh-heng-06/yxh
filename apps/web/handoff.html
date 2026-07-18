@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#17251d">
+  <title>放心交接卡</title>
+  <link rel="icon" href="/icon.svg">
+  <link rel="stylesheet" href="/handoff.css?v=1">
+</head>
+<body>
+  <main id="handoff-card" hidden>
+    <header>
+      <p id="shop-name">门店交接</p>
+      <h1>放心交接卡</h1>
+      <span id="handoff-number"></span>
+    </header>
+    <section class="trust-note">这是成交时冻结的信息快照，帮助顾客与门店共同留存机况、成交与质保约定。</section>
+    <section>
+      <h2>设备信息</h2>
+      <dl id="device-info"></dl>
+    </section>
+    <section>
+      <h2>成交信息</h2>
+      <dl id="sale-info"></dl>
+    </section>
+    <section>
+      <h2>质保约定</h2>
+      <div id="warranty-badge" class="badge"></div>
+      <p id="warranty-terms"></p>
+    </section>
+    <section>
+      <h2>交机说明</h2>
+      <h3>已知情况/瑕疵</h3><p id="disclosure"></p>
+      <h3>未检测或无法确认</h3><p id="unchecked"></p>
+      <h3>当面交机确认</h3><ul id="checklist"></ul>
+    </section>
+    <p id="notice" class="footnote"></p>
+    <a id="save-card" class="save" download>保存交接卡长图</a>
+    <p class="tip">请保存到手机相册，离开门店Wi-Fi后仍可查看。</p>
+  </main>
+  <section id="loading" class="state">正在读取交接卡…</section>
+  <section id="error" class="state error" hidden><h1>交接卡无法打开</h1><p id="error-message"></p><small>请联系门店核对或补发新的交接码。</small></section>
+  <script type="module" src="/handoff.js?v=1"></script>
+</body>
+</html>

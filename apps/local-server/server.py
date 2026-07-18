@@ -56,6 +56,10 @@ try:
 except ImportError:
     zxingcpp = None
 try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None
+try:
     from ocr_intake import recognize_device_screenshot
 except ImportError:
     recognize_device_screenshot = None
@@ -66,13 +70,18 @@ except ImportError:
 
 COOKIE_NAME = "zhanggui_session"
 APP_VERSION = "1.0.0"
-SESSION_DAYS = 30
-PBKDF2_ROUNDS = 260_000
+SESSION_HOURS = 12
+PASSWORD_MIN_LENGTH = 10
+PBKDF2_ROUNDS = 600_000
+LEGACY_PBKDF2_ROUNDS = 260_000
 WRITE_LOCK = threading.Lock()
 BACKUP_LOCK = threading.Lock()
 MARKET_FEED_LOCK = threading.Lock()
 LOGIN_LOCK = threading.Lock()
+HANDOFF_CARD_LOCK = threading.Lock()
 LOGIN_FAILURES: dict[str, list[datetime]] = {}
+LOGIN_IP_FAILURES: dict[str, list[datetime]] = {}
+PUBLIC_RATE_LIMITS: dict[str, list[datetime]] = {}
 MARKET_FEED_PAGES = {
     "5041": {"name":"博能二手回收·苹果有保", "url":"https://13994040400.huishoubaojia.com/5041.html", "minimumRows":20},
     "5042": {"name":"博能二手回收·苹果无保", "url":"https://13994040400.huishoubaojia.com/5042.html", "minimumRows":80},
@@ -208,6 +217,27 @@ def migrate_db() -> None:
                 create trigger if not exists audit_events_no_delete before delete on audit_events begin select raise(abort,'audit events are immutable'); end;
             """)
             db.execute("insert into schema_migrations(version,applied_at) values(6,?)", (now_iso(),))
+        if 7 not in applied:
+            db.executescript("""
+                create table if not exists customer_handoffs (
+                  id text primary key, shop_id text not null references shops(id),
+                  device_id text not null references devices(id), sale_id text not null unique references sales(id),
+                  handoff_number text not null, access_token_hash text not null unique, token_hint text not null,
+                  status text not null default 'active' check(status in ('active','void')),
+                  snapshot text not null, created_by text not null references users(id), created_at text not null,
+                  reissued_at text, voided_at text, last_viewed_at text, view_count integer not null default 0,
+                  unique(shop_id,handoff_number)
+                );
+                create index if not exists customer_handoffs_device_idx on customer_handoffs(device_id,created_at desc);
+                create table if not exists customer_handoff_events (
+                  id integer primary key autoincrement, handoff_id text not null references customer_handoffs(id),
+                  event_type text not null check(event_type in ('created','view','download','reissue','void')),
+                  actor_id text references users(id) on delete set null, client_ip text not null default '',
+                  details text not null default '{}', created_at text not null
+                );
+                create index if not exists customer_handoff_events_idx on customer_handoff_events(handoff_id,created_at desc,id desc);
+            """)
+            db.execute("insert into schema_migrations(version,applied_at) values(7,?)", (now_iso(),))
 
 
 def database_check() -> str:
@@ -346,6 +376,7 @@ def save_market_image(image_url: str) -> tuple[Path, str]:
         suffix = ".webp"
     else:
         raise ValueError("网页返回的不是支持的报价原图")
+    validate_image_bytes(body)
     directory = DB_PATH.parent / "market-sheets"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{uuid.uuid4()}{suffix}"
@@ -482,15 +513,43 @@ def printer_state() -> dict:
         return {"connected": False, "status": "检测失败"}
 
 
-def hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
+def hash_password(password: str, salt: bytes | None = None, rounds: int = PBKDF2_ROUNDS) -> tuple[str, str]:
     salt = salt or secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
-    return digest.hex(), salt.hex()
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
+    return digest.hex(), f"{rounds}${salt.hex()}"
 
 
 def verify_password(password: str, expected: str, salt_hex: str) -> bool:
-    actual, _ = hash_password(password, bytes.fromhex(salt_hex))
+    if "$" in salt_hex:
+        rounds_text, encoded_salt = salt_hex.split("$", 1)
+        rounds = int(rounds_text)
+    else:
+        rounds, encoded_salt = LEGACY_PBKDF2_ROUNDS, salt_hex
+    actual, _ = hash_password(password, bytes.fromhex(encoded_salt), rounds)
     return hmac.compare_digest(actual, expected)
+
+
+def password_needs_rehash(salt_value: str) -> bool:
+    try:
+        return "$" not in salt_value or int(salt_value.split("$", 1)[0]) < PBKDF2_ROUNDS
+    except (TypeError, ValueError):
+        return True
+
+
+def validate_image_bytes(body: bytes, *, max_pixels: int = 24_000_000) -> tuple[int, int, str]:
+    if Image is None:
+        raise ValueError("图片安全检查组件没有安装")
+    try:
+        with Image.open(io.BytesIO(body)) as probe:
+            image_format = str(probe.format or "").upper()
+            width, height = probe.size
+    except Exception as error:
+        raise ValueError("图片文件已损坏或格式不受支持") from error
+    if image_format not in {"PNG", "JPEG", "WEBP"}:
+        raise ValueError("只支持PNG、JPG或WebP图片")
+    if width < 1 or height < 1 or width > 10_000 or height > 10_000 or width * height > max_pixels:
+        raise ValueError("图片像素尺寸过大")
+    return width, height, image_format
 
 
 def lan_ip() -> str:
@@ -570,6 +629,7 @@ class ApiError(Exception):
 
 class StoreHandler(SimpleHTTPRequestHandler):
     server_version = "ZhangGuiLocal/1.0"
+    sys_version = ""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
@@ -577,10 +637,16 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def end_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Permitted-Cross-Domain-Policies", "none")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Permissions-Policy", "geolocation=(), microphone=()")
-        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; media-src 'self' blob:")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(self), geolocation=(), microphone=(), usb=()")
+        self.send_header("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; media-src 'self' blob:")
         super().end_headers()
+
+    def version_string(self) -> str:
+        return self.server_version
 
     @property
     def client_ip(self) -> str:
@@ -640,9 +706,32 @@ class StoreHandler(SimpleHTTPRequestHandler):
         if self.headers.get("X-ZhangGui-Request") != "1":
             raise ApiError(HTTPStatus.FORBIDDEN, "请求校验失败")
 
+    def require_public_rate(self, bucket: str, token: str, limit: int, window_seconds: int = 60) -> None:
+        current = datetime.now(timezone.utc)
+        token_hint = hashlib.sha256(token.encode()).hexdigest()[:16]
+        key = f"{bucket}:{self.client_ip}:{token_hint}"
+        with LOGIN_LOCK:
+            recent = [stamp for stamp in PUBLIC_RATE_LIMITS.get(key, []) if (current - stamp).total_seconds() < window_seconds]
+            if len(recent) >= limit:
+                raise ApiError(HTTPStatus.TOO_MANY_REQUESTS, "访问过于频繁，请稍后再试")
+            recent.append(current)
+            PUBLIC_RATE_LIMITS[key] = recent
+
     def do_GET(self) -> None:
         try:
             path = self.path_only
+            if path.startswith("/api/public/handoffs/"):
+                parts = path.strip("/").split("/")
+                if len(parts) == 4:
+                    self.require_public_rate("handoff-view", parts[3], 30)
+                    return self.send_public_handoff(parts[3])
+                if len(parts) == 5 and parts[4] == "qr.svg":
+                    self.require_public_rate("handoff-qr", parts[3], 15)
+                    return self.send_handoff_qr(parts[3])
+                if len(parts) == 5 and parts[4] == "card.png":
+                    self.require_public_rate("handoff-card", parts[3], 6)
+                    return self.send_handoff_card(parts[3])
+                raise ApiError(HTTPStatus.NOT_FOUND, "交接卡地址不存在")
             if path == "/api/setup-status":
                 with connect() as db: configured = db.execute("select exists(select 1 from users)").fetchone()[0] == 1
                 return self.send_json({"configured": configured})
@@ -705,7 +794,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/photos/"):
                 return self.send_device_photo(self.current_user(), path.split("/")[3])
             if path == "/api/health":
-                return self.send_json({"ok": True, "version": APP_VERSION, "database": str(DB_PATH), "databaseCheck": database_check(), "time": now_iso()})
+                return self.send_json({"ok": True, "version": APP_VERSION, "databaseCheck": database_check(), "time": now_iso()})
             super().do_GET()
         except ApiError as error:
             self.send_json({"error": str(error)}, error.status)
@@ -776,6 +865,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.sell(self.current_user(), path.split("/")[3], self.read_json())
             if path.startswith("/api/sales/") and path.endswith("/update"):
                 return self.update_sale(self.current_user(), path.split("/")[3], self.read_json())
+            if path.startswith("/api/sales/") and path.endswith("/handoff/reissue"):
+                return self.reissue_handoff(self.current_user(), path.split("/")[3])
+            if path.startswith("/api/sales/") and path.endswith("/handoff/void"):
+                return self.void_handoff(self.current_user(), path.split("/")[3])
             if path == "/api/users": return self.create_user(self.current_user(), self.read_json())
             if path.startswith("/api/users/") and path.endswith("/toggle"):
                 return self.toggle_user(self.current_user(), path.split("/")[3])
@@ -795,8 +888,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
         username = str(data.get("username", "")).strip()
         display_name = str(data.get("displayName", "")).strip()
         password = str(data.get("password", ""))
-        if not shop_name or not username or not display_name or len(password) < 6:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "请完整填写，密码至少6位")
+        if not shop_name or not username or not display_name or len(password) < PASSWORD_MIN_LENGTH:
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"请完整填写，密码至少{PASSWORD_MIN_LENGTH}位")
+        if len(shop_name) > 80 or len(username) > 64 or len(display_name) > 80:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "门店名称或账号信息过长")
         digest, salt = hash_password(password)
         stamp, shop_id, user_id = now_iso(), str(uuid.uuid4()), str(uuid.uuid4())
         with WRITE_LOCK, connect() as db:
@@ -811,12 +906,16 @@ class StoreHandler(SimpleHTTPRequestHandler):
 
     def login(self, data: dict) -> None:
         username, password = str(data.get("username", "")).strip(), str(data.get("password", ""))
+        if not username or len(username) > 64 or len(password) > 256:
+            raise ApiError(HTTPStatus.UNAUTHORIZED, "用户名或密码不正确")
         failure_key = f"{self.client_ip}:{username.lower()}"
         current = datetime.now(timezone.utc)
         with LOGIN_LOCK:
             recent = [stamp for stamp in LOGIN_FAILURES.get(failure_key, []) if current - stamp < timedelta(minutes=15)]
+            ip_recent = [stamp for stamp in LOGIN_IP_FAILURES.get(self.client_ip, []) if current - stamp < timedelta(minutes=15)]
             LOGIN_FAILURES[failure_key] = recent
-            if len(recent) >= 5:
+            LOGIN_IP_FAILURES[self.client_ip] = ip_recent
+            if len(recent) >= 5 or len(ip_recent) >= 25:
                 raise ApiError(HTTPStatus.TOO_MANY_REQUESTS, "登录失败次数过多，请15分钟后再试")
         invalid_login = False
         with connect() as db:
@@ -824,12 +923,17 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if not row or not row["active"] or not verify_password(password, row["password_hash"], row["password_salt"]):
                 with LOGIN_LOCK:
                     LOGIN_FAILURES.setdefault(failure_key, []).append(current)
+                    LOGIN_IP_FAILURES.setdefault(self.client_ip, []).append(current)
                 shop_id = row["shop_id"] if row else (db.execute("select id from shops order by created_at limit 1").fetchone() or [None])[0]
                 audit_insert(db, shop_id=shop_id, action="login_failed", summary=f"登录失败：{username or '空用户名'}", success=False, client_ip=self.client_ip)
                 invalid_login = True
             else:
+                if password_needs_rehash(row["password_salt"]):
+                    upgraded_digest, upgraded_salt = hash_password(password)
+                    db.execute("update users set password_hash=?,password_salt=? where id=?", (upgraded_digest,upgraded_salt,row["id"]))
                 token = secrets.token_urlsafe(32)
-                expires = (datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds")
+                expires = (datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)).isoformat(timespec="seconds")
+                db.execute("delete from sessions where expires_at<=?", (now_iso(),))
                 db.execute("insert into sessions(token_hash,user_id,expires_at,created_at,last_seen_at) values(?,?,?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), row["id"], expires, now_iso(), now_iso()))
                 actor = {"id": row["id"], "display_name": row["display_name"], "role": row["role"]}
                 audit_insert(db, shop_id=row["shop_id"], action="login", summary="登录系统", actor=actor, entity_type="session", client_ip=self.client_ip)
@@ -837,7 +941,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             raise ApiError(HTTPStatus.UNAUTHORIZED, "用户名或密码不正确")
         with LOGIN_LOCK:
             LOGIN_FAILURES.pop(failure_key, None)
-        cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS*86400}"
+        cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_HOURS*3600}; Priority=High"
         self.send_json({"ok": True}, cookie=cookie)
 
     def logout(self) -> None:
@@ -853,8 +957,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
         if actor["role"] != "owner": raise ApiError(HTTPStatus.FORBIDDEN, "只有老板可以添加店员")
         username, display = str(data.get("username", "")).strip(), str(data.get("displayName", "")).strip()
         password = str(data.get("password", "")); role = str(data.get("role", "staff"))
-        if not username or not display or len(password) < 6 or role not in ("owner", "staff"):
+        if not username or not display or len(password) < PASSWORD_MIN_LENGTH or role not in ("owner", "staff"):
             raise ApiError(HTTPStatus.BAD_REQUEST, "店员资料不完整")
+        if len(username) > 64 or len(display) > 80:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "店员姓名或用户名过长")
         digest, salt = hash_password(password)
         user_id = str(uuid.uuid4())
         with connect() as db:
@@ -880,7 +986,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
 
     def change_password(self, actor: dict, data: dict) -> None:
         old_password, new_password = str(data.get("oldPassword", "")), str(data.get("newPassword", ""))
-        if len(new_password) < 6: raise ApiError(HTTPStatus.BAD_REQUEST, "新密码至少6位")
+        if len(new_password) < PASSWORD_MIN_LENGTH: raise ApiError(HTTPStatus.BAD_REQUEST, f"新密码至少{PASSWORD_MIN_LENGTH}位")
         with connect() as db:
             row = db.execute("select password_hash,password_salt from users where id=?", (actor["id"],)).fetchone()
             if not row or not verify_password(old_password, row["password_hash"], row["password_salt"]):
@@ -992,6 +1098,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
             raise ApiError(HTTPStatus.BAD_REQUEST, "截图数据不正确")
         if not 1_000 <= len(image) <= 10_000_000:
             raise ApiError(HTTPStatus.BAD_REQUEST, "截图大小不正确")
+        try:
+            validate_image_bytes(image)
+        except ValueError as error:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(error))
         suffix = ".jpg" if match.group(1).lower() in ("jpeg", "jpg") else f".{match.group(1).lower()}"
         screenshot_dir = DB_PATH.parent / "source-screenshots"
         screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -1013,7 +1123,12 @@ class StoreHandler(SimpleHTTPRequestHandler):
         if not match: raise ApiError(HTTPStatus.BAD_REQUEST, "请选择二维码照片")
         try:
             image_bytes = base64.b64decode(match.group(2), validate=True)
+            if not 500 <= len(image_bytes) <= 10_000_000:
+                raise ValueError("二维码图片大小不正确")
+            validate_image_bytes(image_bytes)
             value = decode_qr_image(image_bytes)
+        except ValueError as error:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(error))
         except Exception:
             value = ""
         value = value.strip()
@@ -1057,18 +1172,20 @@ class StoreHandler(SimpleHTTPRequestHandler):
             result["photos"] = [dict(item) for item in db.execute("select id,photo_type,description,created_at from device_photos where device_id=? order by created_at", (device_id,))]
             reservation = db.execute("select * from reservations where device_id=? and status='active' order by created_at desc limit 1", (device_id,)).fetchone()
             repair = db.execute("select * from repairs where device_id=? and status in ('sent','repairing') order by sent_at desc limit 1", (device_id,)).fetchone()
-            sale = db.execute("select * from sales where device_id=? order by sold_at desc limit 1", (device_id,)).fetchone()
+            sale = db.execute("select * from sales where device_id=? order by sold_at desc,rowid desc limit 1", (device_id,)).fetchone()
             cases = [dict(item) for item in db.execute("""select a.*,u.display_name created_by_name,coalesce(c.display_name,'') closed_by_name
                 from after_sales_cases a join users u on u.id=a.created_by left join users c on c.id=a.closed_by
                 where a.device_id=? order by a.created_at desc""", (device_id,))]
             latest_sale = dict(sale) if sale else None
+            handoff = db.execute("""select id,handoff_number,status,token_hint,created_at,reissued_at,voided_at,last_viewed_at,view_count
+                from customer_handoffs where sale_id=?""", (sale["id"],)).fetchone() if sale else None
             if latest_sale:
                 expires = latest_sale.get("warranty_expires_at")
                 if not expires and latest_sale.get("warranty_days"):
                     expires = (datetime.fromisoformat(latest_sale["sold_at"]) + timedelta(days=int(latest_sale["warranty_days"]))).isoformat(timespec="seconds")
                     latest_sale["warranty_expires_at"] = expires
                 latest_sale["warranty_status"] = "none" if not expires else ("active" if datetime.fromisoformat(expires) >= datetime.now(timezone.utc) else "expired")
-            result["reservation"] = dict(reservation) if reservation else None; result["repair"] = dict(repair) if repair else None; result["latestSale"] = latest_sale; result["afterSales"] = cases
+            result["reservation"] = dict(reservation) if reservation else None; result["repair"] = dict(repair) if repair else None; result["latestSale"] = latest_sale; result["handoff"] = dict(handoff) if handoff else None; result["afterSales"] = cases
         if user["role"] != "owner":
             result.pop("imei", None); result.pop("imei2", None)
             if result.get("latestSale"):
@@ -1166,11 +1283,15 @@ class StoreHandler(SimpleHTTPRequestHandler):
         if not reason or disposition not in ("restock","repair","scrap"): raise ApiError(HTTPStatus.BAD_REQUEST,"退货资料不完整")
         target={"restock":"in_stock","repair":"in_repair","scrap":"scrapped"}[disposition]; stamp=now_iso()
         with WRITE_LOCK,connect() as db:
-            device=db.execute("select * from devices where id=? and shop_id=?",(device_id,user["shop_id"])).fetchone(); sale=db.execute("select * from sales where device_id=? order by sold_at desc limit 1",(device_id,)).fetchone()
+            device=db.execute("select * from devices where id=? and shop_id=?",(device_id,user["shop_id"])).fetchone(); sale=db.execute("select * from sales where device_id=? order by sold_at desc,rowid desc limit 1",(device_id,)).fetchone()
             if not device or device["status"]!="sold" or not sale: raise ApiError(HTTPStatus.CONFLICT,"只有已售设备可以退货")
             db.execute("insert into returns values(?,?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),user["shop_id"],device_id,sale["id"],float(data.get("refundAmount") or sale["sale_price"]),reason,disposition,user["id"],stamp))
             db.execute("update devices set status=?,updated_by=?,updated_at=? where id=?",(target,user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,metadata,actor_id,created_at) values(?,?,?,?,?,?,?,?,?)",(user["shop_id"],device_id,"return","sold",target,reason,json.dumps({"refundAmount":data.get("refundAmount") or sale["sale_price"]},ensure_ascii=False),user["id"],stamp))
+            handoff = db.execute("select id from customer_handoffs where sale_id=? and status='active'", (sale["id"],)).fetchone()
+            if handoff:
+                db.execute("update customer_handoffs set status='void',voided_at=? where id=?", (stamp,handoff["id"]))
+                db.execute("insert into customer_handoff_events(handoff_id,event_type,actor_id,client_ip,details,created_at) values(?,?,?,?,?,?)", (handoff["id"],"void",user["id"],self.client_ip,json.dumps({"reason":"sale_return"},ensure_ascii=False),stamp))
             audit_insert(db, shop_id=user["shop_id"], action="sale_return", summary=f"销售退货：{device['stock_code']}", actor=user, entity_type="sale", entity_id=sale["id"], details={"refundAmount": float(data.get("refundAmount") or sale["sale_price"]), "disposition": disposition}, client_ip=self.client_ip)
         self.send_json({"ok":True,"status":target})
 
@@ -1181,7 +1302,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         stamp, case_id = now_iso(), str(uuid.uuid4())
         with WRITE_LOCK, connect() as db:
             device = db.execute("select * from devices where id=? and shop_id=? and deleted_at is null", (device_id, user["shop_id"])).fetchone()
-            sale = db.execute("select * from sales where device_id=? and shop_id=? order by sold_at desc limit 1", (device_id, user["shop_id"])).fetchone()
+            sale = db.execute("select * from sales where device_id=? and shop_id=? order by sold_at desc,rowid desc limit 1", (device_id, user["shop_id"])).fetchone()
             if not device or not sale:
                 raise ApiError(HTTPStatus.CONFLICT, "该设备没有销售记录，不能登记售后")
             db.execute("""insert into after_sales_cases(id,shop_id,device_id,sale_id,issue,created_by,created_at,updated_at)
@@ -1308,7 +1429,225 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)", (user["shop_id"],device_id,"sale",device["status"],"sold",str(data.get("customerNote", "")),user["id"],stamp))
             audit_insert(db, shop_id=user["shop_id"], action="device_sale", summary=f"出库：{device['stock_code']}，成交价{price:g}元", actor=user, entity_type="sale", entity_id=sale_id, details={"stockCode": device["stock_code"], "warrantyDays": warranty_days}, client_ip=self.client_ip)
             db.commit()
-        self.send_json({"ok": True, "saleId": sale_id})
+        response = {"ok": True, "saleId": sale_id}
+        try:
+            response["handoff"] = self.create_handoff_for_sale(user, sale_id, data)
+        except Exception as error:
+            LOGGER.exception("handoff creation failed sale=%s", sale_id)
+            response["handoffError"] = "出库已成功，但交接卡生成失败，可在设备详情中重试"
+            try:
+                with connect() as db:
+                    audit_insert(db, shop_id=user["shop_id"], action="handoff_create_failed", summary=f"交接卡生成失败：{device['stock_code']}", actor=user, entity_type="sale", entity_id=sale_id, details={"error": type(error).__name__}, success=False, client_ip=self.client_ip)
+            except Exception:
+                LOGGER.exception("handoff failure audit failed sale=%s", sale_id)
+        self.send_json(response)
+
+    def handoff_links(self, handoff_id: str, handoff_number: str, token: str) -> dict:
+        base = self.phone_url.rstrip("/")
+        return {
+            "id": handoff_id,
+            "number": handoff_number,
+            "url": f"{base}/handoff.html?t={token}",
+            "qrUrl": f"/api/public/handoffs/{token}/qr.svg",
+            "cardUrl": f"/api/public/handoffs/{token}/card.png",
+        }
+
+    def create_handoff_for_sale(self, user: dict, sale_id: str, data: dict) -> dict:
+        with connect() as db:
+            row = db.execute("""select s.*,d.stock_code,d.color,d.system_version,d.battery_health,d.charge_cycles,
+                d.condition_grade,sh.name shop_name,u.display_name sold_by_name
+                from sales s join devices d on d.id=s.device_id join shops sh on sh.id=s.shop_id
+                join users u on u.id=s.sold_by where s.id=? and s.shop_id=?""", (sale_id,user["shop_id"])).fetchone()
+        if not row:
+            raise ApiError(HTTPStatus.NOT_FOUND, "没有找到销售记录")
+        truthy = lambda key: str(data.get(key, "")).lower() in ("1","true","on","yes")
+        checklist_labels = {
+            "deliveryExterior": "外观已当面核对",
+            "deliveryFunctions": "主要功能已当面测试",
+            "deliveryAccount": "账号退出与数据交接已确认",
+            "deliveryGifts": "随机赠品已当面点清",
+        }
+        warranty_days = int(row["warranty_days"] or 0)
+        default_terms = "门店质保覆盖正常使用中的非人为功能故障；摔碰、进水、私自拆修等情况需检测后确认。" if warranty_days else "本单未提供门店质保，但不影响法律法规规定的权利。"
+        disclosure = str(data.get("handoffDisclosure", "")).strip()[:500]
+        unchecked = str(data.get("handoffUnchecked", "")).strip()[:300]
+        warranty_terms = str(data.get("warrantyTerms", "")).strip()[:500] or default_terms
+        gifts = [label for key,label in (("gift_case","手机壳"),("gift_screen_protector","手机膜"),("gift_charging_head","充电头"),("gift_charger","充电器")) if row[key]]
+        handoff_id = str(uuid.uuid4())
+        handoff_number = f"HJ{datetime.now().strftime('%y%m%d')}-{handoff_id[:6].upper()}"
+        snapshot = {
+            "version": 1,
+            "handoffNumber": handoff_number,
+            "shopName": row["shop_name"],
+            "createdAt": row["sold_at"],
+            "device": {
+                "stockCode": row["stock_code"], "model": row["model_snapshot"], "storage": row["storage_snapshot"],
+                "color": row["color"] or "", "systemVersion": row["system_version"] or "",
+                "batteryHealth": row["battery_health"], "chargeCycles": row["charge_cycles"],
+                "conditionGrade": row["condition_grade"] or "", "imeiTail": (row["imei_snapshot"] or "")[-4:],
+            },
+            "sale": {"price": row["sale_price"], "paymentMethod": row["payment_method"] or "", "gifts": gifts},
+            "warranty": {"days": warranty_days, "expiresAt": row["warranty_expires_at"], "terms": warranty_terms},
+            "disclosure": disclosure,
+            "unchecked": unchecked,
+            "checklist": [label for key,label in checklist_labels.items() if truthy(key)],
+            "notice": "本卡是成交时的信息快照，不展示回收成本、利润或完整IMEI。",
+        }
+        token = secrets.token_urlsafe(32)
+        stamp = now_iso()
+        with WRITE_LOCK, connect() as db:
+            db.execute("""insert into customer_handoffs(id,shop_id,device_id,sale_id,handoff_number,access_token_hash,token_hint,snapshot,created_by,created_at)
+                values(?,?,?,?,?,?,?,?,?,?)""", (handoff_id,user["shop_id"],row["device_id"],sale_id,handoff_number,hashlib.sha256(token.encode()).hexdigest(),token[-8:],json.dumps(snapshot,ensure_ascii=False,separators=(",",":")),user["id"],stamp))
+            db.execute("insert into customer_handoff_events(handoff_id,event_type,actor_id,client_ip,created_at) values(?,?,?,?,?)", (handoff_id,"created",user["id"],self.client_ip,stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="handoff_create", summary=f"生成顾客交接卡：{handoff_number}", actor=user, entity_type="handoff", entity_id=handoff_id, details={"saleId":sale_id}, client_ip=self.client_ip)
+        return self.handoff_links(handoff_id, handoff_number, token)
+
+    def handoff_by_token(self, token: str, allow_void: bool = False) -> tuple[dict, dict]:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{40,64}", token or ""):
+            raise ApiError(HTTPStatus.NOT_FOUND, "交接卡不存在")
+        with connect() as db:
+            row = db.execute("select * from customer_handoffs where access_token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+        if not row:
+            raise ApiError(HTTPStatus.NOT_FOUND, "交接卡不存在或链接已更新")
+        if row["status"] != "active" and not allow_void:
+            raise ApiError(HTTPStatus.GONE, "这张交接卡已作废，请联系门店")
+        return dict(row), json.loads(row["snapshot"])
+
+    def public_handoff_payload(self, token: str, record_view: bool = False) -> tuple[dict, dict]:
+        handoff, snapshot = self.handoff_by_token(token)
+        expires = snapshot.get("warranty", {}).get("expiresAt")
+        snapshot["warranty"]["status"] = "none" if not expires else ("active" if datetime.fromisoformat(expires) >= datetime.now(timezone.utc) else "expired")
+        snapshot["cardUrl"] = f"/api/public/handoffs/{token}/card.png"
+        if record_view:
+            stamp = now_iso()
+            with connect() as db:
+                cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+                duplicate = db.execute("select 1 from customer_handoff_events where handoff_id=? and event_type='view' and client_ip=? and created_at>=? limit 1", (handoff["id"],self.client_ip,cutoff)).fetchone()
+                if not duplicate:
+                    db.execute("update customer_handoffs set view_count=view_count+1,last_viewed_at=? where id=?", (stamp,handoff["id"]))
+                    db.execute("insert into customer_handoff_events(handoff_id,event_type,client_ip,created_at) values(?,?,?,?)", (handoff["id"],"view",self.client_ip,stamp))
+        return handoff, snapshot
+
+    def send_public_handoff(self, token: str) -> None:
+        _, snapshot = self.public_handoff_payload(token, record_view=True)
+        self.send_json(snapshot)
+
+    def send_handoff_qr(self, token: str) -> None:
+        self.handoff_by_token(token)
+        if qrcode is None:
+            raise ApiError(HTTPStatus.NOT_IMPLEMENTED, "二维码组件未安装")
+        target = f"{self.phone_url.rstrip('/')}/handoff.html?t={token}"
+        image = qrcode.make(target, image_factory=qrcode.image.svg.SvgPathImage, border=2)
+        output = io.BytesIO(); image.save(output); body = output.getvalue()
+        self.send_response(HTTPStatus.OK); self.send_header("Content-Type","image/svg+xml"); self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(body)
+
+    def render_handoff_card(self, snapshot: dict) -> bytes:
+        if Image is None or ImageDraw is None or ImageFont is None:
+            raise ApiError(HTTPStatus.NOT_IMPLEMENTED, "图片组件未安装")
+        width, max_height = 1080, 5200
+        canvas = Image.new("RGB", (width,max_height), "#f4f1e8")
+        draw = ImageDraw.Draw(canvas)
+        font_path = next((path for path in (r"C:\Windows\Fonts\msyh.ttc",r"C:\Windows\Fonts\simhei.ttf") if Path(path).exists()), None)
+        if not font_path:
+            raise ApiError(HTTPStatus.NOT_IMPLEMENTED, "系统中没有找到中文字体")
+        title_font = ImageFont.truetype(font_path, 58); h2_font = ImageFont.truetype(font_path, 34)
+        body_font = ImageFont.truetype(font_path, 29); small_font = ImageFont.truetype(font_path, 24)
+        muted, ink, accent, white = "#68736a", "#17251d", "#3f7049", "#ffffff"
+
+        def wrapped(text: str, font, limit: int) -> list[str]:
+            lines, current = [], ""
+            for char in str(text or "-"):
+                if char == "\n": lines.append(current or " "); current = ""; continue
+                candidate = current + char
+                if current and draw.textlength(candidate,font=font) > limit:
+                    lines.append(current); current = char
+                else: current = candidate
+            if current: lines.append(current)
+            return lines or ["-"]
+
+        y = 0
+        draw.rectangle((0,0,width,310),fill=ink)
+        draw.text((70,58),snapshot.get("shopName","门店交接"),font=h2_font,fill="#d8ff58")
+        draw.text((70,112),"放心交接卡",font=title_font,fill=white)
+        draw.text((70,205),f"编号 {snapshot.get('handoffNumber','-')}",font=small_font,fill="#c4cec7")
+        y = 350
+
+        def section(title: str, rows: list[tuple[str,str]]) -> None:
+            nonlocal y
+            row_lines = [(label,wrapped(value,body_font,710)) for label,value in rows]
+            height = 72 + sum(max(48,len(lines)*41+14) for _,lines in row_lines) + 24
+            draw.rounded_rectangle((45,y,width-45,y+height),radius=28,fill=white)
+            draw.text((75,y+28),title,font=h2_font,fill=accent); cursor=y+88
+            for label,lines in row_lines:
+                draw.text((75,cursor),label,font=small_font,fill=muted)
+                draw.multiline_text((285,cursor-3),"\n".join(lines),font=body_font,fill=ink,spacing=8)
+                cursor += max(48,len(lines)*41+14)
+            y += height + 25
+
+        device=snapshot["device"]; sale=snapshot["sale"]; warranty=snapshot["warranty"]
+        section("设备信息",[("设备",f"{device.get('model','-')}  {device.get('storage','-')}  {device.get('color') or ''}"),("库存编号",device.get("stockCode","-")),("IMEI尾号",device.get("imeiTail") or "-"),("成色/电池",f"{device.get('conditionGrade') or '-'} / {device.get('batteryHealth') if device.get('batteryHealth') is not None else '-'}%"),("系统/循环",f"{device.get('systemVersion') or '-'} / {device.get('chargeCycles') if device.get('chargeCycles') is not None else '-'}次")])
+        gift_text = "、".join(sale.get("gifts") or []) or "无"
+        section("成交信息",[("成交价",f"￥{float(sale.get('price') or 0):g}"),("支付方式",sale.get("paymentMethod") or "-"),("赠品",gift_text),("成交时间",snapshot.get("createdAt","").replace("T"," ")[:19])])
+        warranty_title = f"{warranty.get('days',0)}天门店质保" if warranty.get("days") else "未提供门店质保"
+        section("质保约定",[("质保",warranty_title),("到期日",(warranty.get("expiresAt") or "-")[:10]),("范围",warranty.get("terms") or "-")])
+        section("交机说明",[("已知情况",snapshot.get("disclosure") or "未额外记录已知情况"),("未检测项",snapshot.get("unchecked") or "未额外记录未检测项"),("已确认","\n".join(f"· {item}" for item in snapshot.get("checklist",[])) or "未勾选交机确认项")])
+        footer_lines=wrapped(snapshot.get("notice",""),small_font,width-140)
+        draw.multiline_text((70,y+10),"\n".join(footer_lines),font=small_font,fill=muted,spacing=7)
+        y += len(footer_lines)*36+70
+        return_buffer=io.BytesIO(); canvas.crop((0,0,width,min(max_height,y))).save(return_buffer,format="PNG",optimize=True)
+        return return_buffer.getvalue()
+
+    def send_handoff_card(self, token: str) -> None:
+        handoff, snapshot = self.public_handoff_payload(token)
+        cache_dir = DB_PATH.parent / "handoff-cards"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{handoff['id']}.png"
+        with HANDOFF_CARD_LOCK:
+            if not cache_path.exists():
+                temporary = cache_path.with_suffix(".tmp")
+                temporary.write_bytes(self.render_handoff_card(snapshot))
+                temporary.replace(cache_path)
+            body = cache_path.read_bytes()
+        stamp = now_iso()
+        with connect() as db:
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+            duplicate = db.execute("select 1 from customer_handoff_events where handoff_id=? and event_type='download' and client_ip=? and created_at>=? limit 1", (handoff["id"],self.client_ip,cutoff)).fetchone()
+            if not duplicate:
+                db.execute("insert into customer_handoff_events(handoff_id,event_type,client_ip,created_at) values(?,?,?,?)", (handoff["id"],"download",self.client_ip,stamp))
+        filename = f"handoff-{snapshot.get('handoffNumber','card')}.png"
+        self.send_response(HTTPStatus.OK); self.send_header("Content-Type","image/png"); self.send_header("Content-Disposition",f'attachment; filename="{filename}"'); self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","private,max-age=3600"); self.end_headers(); self.wfile.write(body)
+
+    def reissue_handoff(self, user: dict, sale_id: str) -> None:
+        with connect() as db:
+            sale = db.execute("""select s.id,d.status device_status from sales s join devices d on d.id=s.device_id
+                where s.id=? and s.shop_id=?""", (sale_id,user["shop_id"])).fetchone()
+            handoff = db.execute("select id,handoff_number from customer_handoffs where sale_id=? and shop_id=?", (sale_id,user["shop_id"])).fetchone()
+        if not sale:
+            raise ApiError(HTTPStatus.NOT_FOUND, "没有找到销售记录")
+        if sale["device_status"] != "sold":
+            raise ApiError(HTTPStatus.CONFLICT, "只能为当前已售设备补发交接卡")
+        if not handoff:
+            return self.send_json({"ok":True,"handoff":self.create_handoff_for_sale(user,sale_id,{})}, HTTPStatus.CREATED)
+        token, stamp = secrets.token_urlsafe(32), now_iso()
+        with WRITE_LOCK, connect() as db:
+            db.execute("update customer_handoffs set access_token_hash=?,token_hint=?,status='active',reissued_at=?,voided_at=null where id=?", (hashlib.sha256(token.encode()).hexdigest(),token[-8:],stamp,handoff["id"]))
+            db.execute("insert into customer_handoff_events(handoff_id,event_type,actor_id,client_ip,created_at) values(?,?,?,?,?)", (handoff["id"],"reissue",user["id"],self.client_ip,stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="handoff_reissue", summary=f"补发顾客交接卡：{handoff['handoff_number']}", actor=user, entity_type="handoff", entity_id=handoff["id"], client_ip=self.client_ip)
+        self.send_json({"ok":True,"handoff":self.handoff_links(handoff["id"],handoff["handoff_number"],token)})
+
+    def void_handoff(self, user: dict, sale_id: str) -> None:
+        if user["role"] != "owner":
+            raise ApiError(HTTPStatus.FORBIDDEN, "只有老板可以作废顾客交接卡")
+        stamp = now_iso()
+        with WRITE_LOCK, connect() as db:
+            handoff = db.execute("select id,handoff_number,status from customer_handoffs where sale_id=? and shop_id=?", (sale_id,user["shop_id"])).fetchone()
+            if not handoff:
+                raise ApiError(HTTPStatus.NOT_FOUND, "没有找到交接卡")
+            if handoff["status"] != "void":
+                db.execute("update customer_handoffs set status='void',voided_at=? where id=?", (stamp,handoff["id"]))
+                db.execute("insert into customer_handoff_events(handoff_id,event_type,actor_id,client_ip,created_at) values(?,?,?,?,?)", (handoff["id"],"void",user["id"],self.client_ip,stamp))
+                audit_insert(db, shop_id=user["shop_id"], action="handoff_void", summary=f"作废顾客交接卡：{handoff['handoff_number']}", actor=user, entity_type="handoff", entity_id=handoff["id"], client_ip=self.client_ip)
+        self.send_json({"ok":True})
 
     def daily_ledger(self, user: dict) -> dict:
         query = parse_qs(urlparse(self.path).query)
@@ -1446,6 +1785,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
         try: body=base64.b64decode(match.group(2),validate=True)
         except ValueError: raise ApiError(HTTPStatus.BAD_REQUEST,"照片数据不正确")
         if not 1_000<=len(body)<=10_000_000: raise ApiError(HTTPStatus.BAD_REQUEST,"照片大小不正确")
+        try: validate_image_bytes(body)
+        except ValueError as error: raise ApiError(HTTPStatus.BAD_REQUEST,str(error))
         with connect() as db:
             if not db.execute("select 1 from devices where id=? and shop_id=?",(device_id,user["shop_id"])).fetchone(): raise ApiError(HTTPStatus.NOT_FOUND,"没有找到设备")
         suffix=".jpg" if match.group(1).lower() in ("jpeg","jpg") else "."+match.group(1).lower(); photo_id=str(uuid.uuid4()); directory=DB_PATH.parent/"device-photos"; directory.mkdir(parents=True,exist_ok=True); path=directory/f"{photo_id}{suffix}"; path.write_bytes(body); stamp=now_iso()
@@ -1914,10 +2255,10 @@ def main() -> None:
     if args.db: DB_PATH = Path(args.db).resolve()
     init_db(); database_check(); daily_backup()
     if args.reset_password:
-        first = getpass.getpass("请输入新密码（至少6位）：")
+        first = getpass.getpass(f"请输入新密码（至少{PASSWORD_MIN_LENGTH}位）：")
         second = getpass.getpass("请再次输入新密码：")
-        if len(first) < 6 or first != second:
-            raise SystemExit("密码不足6位或两次输入不一致")
+        if len(first) < PASSWORD_MIN_LENGTH or first != second:
+            raise SystemExit(f"密码不足{PASSWORD_MIN_LENGTH}位或两次输入不一致")
         digest, salt = hash_password(first)
         with connect() as db:
             row = db.execute("select id from users where username=? collate nocase", (args.reset_password,)).fetchone()

@@ -11,6 +11,7 @@ apps/local-server/test-data/
 tmp-*
 device-photos/
 label-previews/
+handoff-cards/
 market-sheets/
 source-screenshots/
 stock-qrcodes/

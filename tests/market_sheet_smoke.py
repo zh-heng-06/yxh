@@ -14,8 +14,8 @@ def main() -> int:
     args = parser.parse_args()
 
     owner = Client(args.base)
-    owner.call("/api/setup", "POST", {"shopName":"报价表测试店","username":"owner","displayName":"老板","password":"test1234"})
-    owner.call("/api/login", "POST", {"username":"owner","password":"test1234"})
+    owner.call("/api/setup", "POST", {"shopName":"报价表测试店","username":"owner","displayName":"老板","password":"test123456"})
+    owner.call("/api/login", "POST", {"username":"owner","password":"test123456"})
     result = owner.call("/api/market/sheet/recognize", "POST", {"sourceName":"博能二手回收","imageUrl":args.url}, timeout=300)
     check(result["capturedOn"] == "2026-07-18" and result["complete"] and result["rowCount"] == result["expectedRowCount"] == 101 and result["quoteCount"] == 505, "长报价表下载、逐格OCR与完整性校验", f"{result['rowCount']}行/{result['quoteCount']}价")
 

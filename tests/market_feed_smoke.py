@@ -12,8 +12,8 @@ def main() -> int:
     parser.add_argument("--base", default="http://127.0.0.1:4201")
     args = parser.parse_args()
     owner = Client(args.base)
-    owner.call("/api/setup", "POST", {"shopName":"官网行情测试店","username":"owner","displayName":"老板","password":"test1234"})
-    owner.call("/api/login", "POST", {"username":"owner","password":"test1234"})
+    owner.call("/api/setup", "POST", {"shopName":"官网行情测试店","username":"owner","displayName":"老板","password":"test123456"})
+    owner.call("/api/login", "POST", {"username":"owner","password":"test123456"})
 
     status = owner.call("/api/market/feed/status")
     check(status["enabled"] and len(status["pages"]) == 2, "官网每日行情配置与老板状态接口")

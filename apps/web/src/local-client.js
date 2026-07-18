@@ -67,6 +67,8 @@ export class LocalClient {
   intake(data){return this.request("/api/devices/intake",{method:"POST",body:data});}
   printLabel(id){return this.request(`/api/devices/${encodeURIComponent(id)}/print`,{method:"POST",body:{}});}
   sell(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/sell`,{method:"POST",body:data,timeout:10000});}
+  reissueHandoff(saleId){return this.request(`/api/sales/${encodeURIComponent(saleId)}/handoff/reissue`,{method:"POST",body:{}});}
+  voidHandoff(saleId){return this.request(`/api/sales/${encodeURIComponent(saleId)}/handoff/void`,{method:"POST",body:{}});}
   events(){return this.request("/api/events");}
   alerts(){return this.request("/api/alerts");}
   auditEvents(filters={}){const p=new URLSearchParams(filters);return this.request(`/api/audit-events?${p}`);}
