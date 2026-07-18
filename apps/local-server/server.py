@@ -6,6 +6,7 @@ import csv
 import getpass
 import hashlib
 import hmac
+import html
 import io
 import json
 import mimetypes
@@ -64,6 +65,11 @@ COOKIE_NAME = "zhanggui_session"
 SESSION_DAYS = 30
 PBKDF2_ROUNDS = 260_000
 WRITE_LOCK = threading.Lock()
+MARKET_FEED_LOCK = threading.Lock()
+MARKET_FEED_PAGES = {
+    "5041": {"name":"博能二手回收·苹果有保", "url":"https://13994040400.huishoubaojia.com/5041.html", "minimumRows":20},
+    "5042": {"name":"博能二手回收·苹果无保", "url":"https://13994040400.huishoubaojia.com/5042.html", "minimumRows":80},
+}
 
 
 def now_iso() -> str:
@@ -127,6 +133,8 @@ def migrate_db() -> None:
             db.execute("insert into schema_migrations(version,applied_at) values(3,?)", (now_iso(),))
         if 4 not in applied:
             db.execute("insert into schema_migrations(version,applied_at) values(4,?)", (now_iso(),))
+        if 5 not in applied:
+            db.execute("insert into schema_migrations(version,applied_at) values(5,?)", (now_iso(),))
 
 
 def database_check() -> str:
@@ -153,6 +161,169 @@ def daily_backup(force: bool = False) -> Path:
         if old.stat().st_mtime < cutoff:
             old.unlink(missing_ok=True)
     return target
+
+
+def fetch_public_market_page(page_id: str) -> dict:
+    config = MARKET_FEED_PAGES.get(page_id)
+    if not config:
+        raise ValueError("目前只支持苹果有保和苹果无保报价页")
+    page_url = config["url"]
+    request = Request(page_url, headers={"User-Agent":"Mozilla/5.0 ZhangGui/1.0","Accept":"text/html"})
+    with urlopen(request, timeout=25) as response:
+        final = urlparse(response.geturl())
+        if final.scheme != "https" or final.hostname != "13994040400.huishoubaojia.com":
+            raise ValueError("报价网页跳转到了未允许的地址")
+        body = response.read(300_001)
+        if len(body) > 300_000 or response.headers.get_content_type() != "text/html":
+            raise ValueError("报价网页格式或大小不正确")
+    text = body.decode("utf-8", errors="replace")
+    image_match = re.search(r'<img\s+class=["\']image_box["\'][^>]+src=["\']([^"\']+)', text, re.I)
+    if not image_match:
+        raise ValueError("报价网页没有找到完整报价原图")
+    image_url = html.unescape(image_match.group(1).strip())
+    image = urlparse(image_url)
+    if image.scheme != "https" or image.hostname != "cos.huishoubaojiadan.com":
+        raise ValueError("报价网页返回了未允许的图片地址")
+    return {**config, "pageId":page_id, "pageUrl":page_url, "imageUrl":image_url}
+
+
+def save_market_image(image_url: str) -> tuple[Path, str]:
+    request = Request(image_url, headers={"User-Agent":"Mozilla/5.0 ZhangGui/1.0","Accept":"image/png,image/jpeg,image/webp"})
+    with urlopen(request, timeout=30) as response:
+        final = urlparse(response.geturl())
+        if final.scheme != "https" or final.hostname != "cos.huishoubaojiadan.com":
+            raise ValueError("报价原图跳转到了未允许的地址")
+        content_type = response.headers.get_content_type()
+        body = response.read(15_000_001)
+    if len(body) > 15_000_000 or len(body) < 1_000 or content_type not in ("image/png","image/jpeg","image/webp"):
+        raise ValueError("报价原图格式或大小不正确")
+    if body.startswith(b"\x89PNG"):
+        suffix = ".png"
+    elif body.startswith(b"\xff\xd8"):
+        suffix = ".jpg"
+    elif body.startswith(b"RIFF") and body[8:12] == b"WEBP":
+        suffix = ".webp"
+    else:
+        raise ValueError("网页返回的不是支持的报价原图")
+    directory = DB_PATH.parent / "market-sheets"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{uuid.uuid4()}{suffix}"
+    path.write_bytes(body)
+    return path, str(path.relative_to(DB_PATH.parent)).replace("\\", "/")
+
+
+def market_result_error(result: dict, minimum_rows: int, previous_rows: int = 0) -> str:
+    rows = result.get("rows") if isinstance(result.get("rows"), list) else []
+    expected = int(result.get("expectedRowCount") or 0)
+    if not result.get("complete") or len(rows) != expected:
+        return f"完整性校验未通过：表格应有{expected}行，识别到{len(rows)}行"
+    required = set(result.get("conditions") or ())
+    if required not in ({"靓机","小花","大花","外爆","内爆可测"},{"高保充新","靓机","小花","大花","外爆","内爆可测"}):
+        return "报价档位表头无法确认"
+    if len(rows) < max(minimum_rows, round(previous_rows * .9)):
+        return f"识别行数异常减少：本次{len(rows)}行，上次{previous_rows}行"
+    seen = set()
+    for row in rows:
+        key = (str(row.get("model", "")).lower(), str(row.get("storage", "")).upper())
+        if not all(key) or key in seen:
+            return "存在空型号、空容量或重复型号容量"
+        seen.add(key)
+        prices = row.get("prices") if isinstance(row.get("prices"), dict) else {}
+        mandatory = required - {"高保充新"}
+        if not mandatory.issubset(prices) or not set(prices).issubset(required):
+            return f"{row.get('model','')} {row.get('storage','')} 五档价格不完整"
+        ordered_names = tuple(name for name in ("高保充新","靓机","小花","大花","外爆","内爆可测") if name in prices)
+        values = [float(prices[name]) for name in ordered_names]
+        if any(value < 50 or value > 50000 for value in values) or values != sorted(values, reverse=True):
+            return f"{row.get('model','')} {row.get('storage','')} 价格顺序异常"
+    return ""
+
+
+def record_market_feed(shop_id: str, feed: dict, captured_on: str, status: str, *, image_url: str = "", file_ref: str = "", result: dict | None = None, imported: int = 0, skipped: int = 0, message: str = "") -> None:
+    result = result or {}
+    with WRITE_LOCK, connect() as db:
+        db.execute("""insert into market_feed_runs(id,shop_id,source_name,page_id,page_url,captured_on,image_url,file_path,status,expected_row_count,row_count,quote_count,imported_count,skipped_count,message,created_at)
+                      values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (str(uuid.uuid4()),shop_id,feed["name"],feed["pageId"],feed["pageUrl"],captured_on,image_url,file_ref,status,int(result.get("expectedRowCount") or 0),int(result.get("rowCount") or 0),int(result.get("quoteCount") or 0),imported,skipped,message[:300],now_iso()))
+
+
+def run_market_feed_page(shop_id: str, owner_id: str, page_id: str) -> dict:
+    if recognize_market_sheet is None:
+        raise RuntimeError("本机行情OCR组件未安装")
+    if not MARKET_FEED_LOCK.acquire(blocking=False):
+        raise RuntimeError("另一个行情同步任务正在进行，请稍后再试")
+    feed = MARKET_FEED_PAGES.get(page_id) or {"name":"未知报价页","pageId":page_id,"pageUrl":"","minimumRows":0}
+    captured_on, image_url, file_ref, result = datetime.now().date().isoformat(), "", "", {}
+    try:
+        feed = fetch_public_market_page(page_id)
+        image_url = feed["imageUrl"]
+        timestamp = parse_qs(urlparse(image_url).query).get("ts", [""])[0]
+        if re.match(r"^20\d{6}", timestamp):
+            captured_on = f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
+        with connect() as db:
+            existing = db.execute("select * from market_feed_runs where shop_id=? and page_id=? and image_url=? and status='success' order by created_at desc limit 1",(shop_id,page_id,image_url)).fetchone()
+            previous = db.execute("select row_count from market_feed_runs where shop_id=? and page_id=? and status='success' order by captured_on desc,created_at desc limit 1",(shop_id,page_id)).fetchone()
+        if existing:
+            return {"ok":True,"status":"unchanged","pageId":page_id,"sourceName":feed["name"],"capturedOn":captured_on,"message":"网页仍是已经成功导入的同一张报价表"}
+        path, file_ref = save_market_image(image_url)
+        result = recognize_market_sheet(path)
+        error = market_result_error(result, int(feed["minimumRows"]), int(previous[0]) if previous else 0)
+        if error:
+            record_market_feed(shop_id,feed,captured_on,"rejected",image_url=image_url,file_ref=file_ref,result=result,message=error)
+            return {"ok":False,"status":"rejected","pageId":page_id,"sourceName":feed["name"],"capturedOn":captured_on,"message":error,**{key:result.get(key) for key in ("rowCount","expectedRowCount","quoteCount")}}
+        stamp, imported, skipped = now_iso(), 0, 0
+        conditions = tuple(result["conditions"])
+        with WRITE_LOCK, connect() as db:
+            db.execute("begin immediate")
+            for row in result["rows"]:
+                for condition in conditions:
+                    if condition not in row["prices"]:
+                        continue
+                    price = float(row["prices"][condition])
+                    exists = db.execute("""select 1 from market_quotes where shop_id=? and source_name=? and quote_type='recycle' and lower(model)=lower(?) and lower(storage)=lower(?) and condition_grade=? and price=? and captured_on=? limit 1""",(shop_id,feed["name"],row["model"],row["storage"],condition,price,captured_on)).fetchone()
+                    if exists:
+                        skipped += 1; continue
+                    note = f"官网每日自动导入 · {feed['pageId']}" + (f" · 网络型号{row.get('networkModel')}" if row.get("networkModel") else "")
+                    db.execute("""insert into market_quotes(id,shop_id,source_name,quote_type,brand,model,storage,condition_grade,battery_health,repair_status,price,captured_on,note,created_by,created_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(str(uuid.uuid4()),shop_id,feed["name"],"recycle",row.get("brand","Apple"),row["model"],row["storage"],condition,None,"unknown",price,captured_on,note,owner_id,stamp))
+                    imported += 1
+            db.execute("""insert into market_sheet_imports(id,shop_id,source_name,captured_on,image_url,file_path,row_count,quote_count,created_by,created_at) values(?,?,?,?,?,?,?,?,?,?)""",(str(uuid.uuid4()),shop_id,feed["name"],captured_on,image_url,file_ref,len(result["rows"]),imported,owner_id,stamp))
+        record_market_feed(shop_id,feed,captured_on,"success",image_url=image_url,file_ref=file_ref,result=result,imported=imported,skipped=skipped,message="完整性和价格顺序校验通过")
+        return {"ok":True,"status":"success","pageId":page_id,"sourceName":feed["name"],"capturedOn":captured_on,"rowCount":result["rowCount"],"quoteCount":result["quoteCount"],"imported":imported,"skipped":skipped,"message":"完整报价已安全导入"}
+    except Exception as error:
+        record_market_feed(shop_id,feed,captured_on,"error",image_url=image_url,file_ref=file_ref,result=result,message=str(error))
+        return {"ok":False,"status":"error","pageId":page_id,"sourceName":feed["name"],"capturedOn":captured_on,"message":str(error)[:200]}
+    finally:
+        MARKET_FEED_LOCK.release()
+
+
+def scheduled_market_feed_cycle() -> None:
+    today = datetime.now().date().isoformat()
+    with connect() as db:
+        owners = db.execute("select s.id shop_id,u.id owner_id from shops s join users u on u.shop_id=s.id and u.role='owner' and u.active=1").fetchall()
+    for owner in owners:
+        for page_id in MARKET_FEED_PAGES:
+            with connect() as db:
+                success = db.execute("select 1 from market_feed_runs where shop_id=? and page_id=? and captured_on=? and status='success' limit 1",(owner["shop_id"],page_id,today)).fetchone()
+                latest = db.execute("select created_at from market_feed_runs where shop_id=? and page_id=? order by created_at desc limit 1",(owner["shop_id"],page_id)).fetchone()
+            if success:
+                continue
+            if latest:
+                attempted = datetime.fromisoformat(latest[0]).replace(tzinfo=None)
+                if datetime.utcnow() - attempted < timedelta(minutes=55):
+                    continue
+            run_market_feed_page(owner["shop_id"],owner["owner_id"],page_id)
+
+
+def market_feed_scheduler(stop_event: threading.Event) -> None:
+    stop_event.wait(10)
+    while not stop_event.is_set():
+        now = datetime.now()
+        if (now.hour, now.minute) >= (14, 30):
+            try:
+                scheduled_market_feed_cycle()
+            except Exception as error:
+                print(f"MARKET_FEED_ERROR: {error}", file=sys.stderr)
+        stop_event.wait(300)
 
 
 def printer_state() -> dict:
@@ -353,6 +524,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.send_json(self.market_summary(self.current_user()))
             if path == "/api/market/decisions":
                 return self.send_json(self.list_pricing_decisions(self.current_user()))
+            if path == "/api/market/feed/status":
+                return self.send_json(self.market_feed_status(self.current_user()))
             if path == "/api/smart/daily-summary":
                 return self.send_json(self.smart_daily_summary(self.current_user()))
             if path.startswith("/api/devices/") and path.endswith("/price-suggestion"):
@@ -404,6 +577,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.recognize_market_sheet_url(self.current_user(), self.read_json())
             if path == "/api/market/sheet/import":
                 return self.import_market_sheet(self.current_user(), self.read_json(5_000_000))
+            if path == "/api/market/feed/sync":
+                return self.sync_market_feed(self.current_user(), self.read_json())
             if path.startswith("/api/market/quotes/") and path.endswith("/delete"):
                 return self.delete_market_quote(self.current_user(), path.split("/")[4])
             if path == "/api/market/decisions":
@@ -1003,6 +1178,24 @@ class StoreHandler(SimpleHTTPRequestHandler):
         if user["role"] != "owner":
             raise ApiError(HTTPStatus.FORBIDDEN, "只有老板可以查看和维护行情")
 
+    def market_feed_status(self, user: dict) -> dict:
+        self.require_market_owner(user)
+        pages = []
+        with connect() as db:
+            for page_id, config in MARKET_FEED_PAGES.items():
+                latest = db.execute("select * from market_feed_runs where shop_id=? and page_id=? order by created_at desc limit 1",(user["shop_id"],page_id)).fetchone()
+                pages.append({"pageId":page_id,"sourceName":config["name"],"pageUrl":config["url"],"lastRun":dict(latest) if latest else None})
+        return {"enabled":True,"schedule":"每天14:30，失败后每小时重试","busy":MARKET_FEED_LOCK.locked(),"pages":pages,"scope":"目前自动导入苹果有保、苹果无保；其他504x页面待逐版式校验后开放"}
+
+    def sync_market_feed(self, user: dict, data: dict) -> None:
+        self.require_market_owner(user)
+        page_id = str(data.get("pageId", "")).strip()
+        if page_id not in MARKET_FEED_PAGES:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "目前只支持5041苹果有保和5042苹果无保")
+        result = run_market_feed_page(user["shop_id"],user["id"],page_id)
+        status = HTTPStatus.OK if result.get("ok") else (HTTPStatus.CONFLICT if "正在进行" in result.get("message", "") else HTTPStatus.UNPROCESSABLE_ENTITY)
+        self.send_json(result,status)
+
     def list_market_quotes(self, user: dict) -> list[dict]:
         self.require_market_owner(user)
         filters = self.market_filters()
@@ -1085,7 +1278,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         if sheet_path.parent != sheet_directory or not sheet_path.is_file():
             raise ApiError(HTTPStatus.BAD_REQUEST, "报价表原图不存在")
         quote_rows = []
-        allowed_conditions = {item[2] for item in ((240,315,"靓机"),(315,387,"小花"),(387,459,"大花"),(459,532,"外爆"),(532,610,"内爆可测"))}
+        allowed_conditions = {"高保充新","靓机","小花","大花","外爆","内爆可测"}
         for row in rows:
             if not isinstance(row, dict): continue
             model, storage = str(row.get("model", "")).strip(), str(row.get("storage", "")).strip().upper()
@@ -1389,11 +1582,18 @@ def main() -> None:
         print("密码重置成功，请重新登录。")
         return
     server=ThreadingHTTPServer(("0.0.0.0",args.port),StoreHandler)
+    market_stop = threading.Event()
+    market_thread = None
+    if not args.db:
+        market_thread = threading.Thread(target=market_feed_scheduler,args=(market_stop,),name="market-feed",daemon=True)
+        market_thread.start()
     print(f"\n掌柜台正式局域网测试系统已启动\n电脑：http://127.0.0.1:{args.port}/\n手机：http://{lan_ip()}:{args.port}/\n")
     if args.open: threading.Timer(.8,lambda:webbrowser.open(f"http://127.0.0.1:{args.port}/")).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
-    finally: server.server_close()
+    finally:
+        market_stop.set()
+        server.server_close()
 
 
 if __name__ == "__main__": main()

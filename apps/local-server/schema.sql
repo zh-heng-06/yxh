@@ -263,3 +263,23 @@ create table if not exists market_sheet_imports (
   created_at text not null
 );
 create index if not exists market_sheet_imports_idx on market_sheet_imports(shop_id, captured_on desc);
+
+create table if not exists market_feed_runs (
+  id text primary key,
+  shop_id text not null references shops(id),
+  source_name text not null,
+  page_id text not null,
+  page_url text not null,
+  captured_on text not null,
+  image_url text not null default '',
+  file_path text not null default '',
+  status text not null check (status in ('success','rejected','error')),
+  expected_row_count integer not null default 0,
+  row_count integer not null default 0,
+  quote_count integer not null default 0,
+  imported_count integer not null default 0,
+  skipped_count integer not null default 0,
+  message text not null default '',
+  created_at text not null
+);
+create index if not exists market_feed_runs_idx on market_feed_runs(shop_id, page_id, captured_on desc, created_at desc);

@@ -37,8 +37,10 @@ def _token(item) -> dict:
 
 
 def _capacity(text: str) -> str:
-    value = text.upper().replace("丨", "1").replace("I", "1")
-    match = re.fullmatch(r"(64|128|256|512|1T)", value)
+    value = text.upper().replace("丨", "1").replace("I", "1").replace(" ", "")
+    value = re.sub(r"(?:GB|G)$", "", value)
+    value = value.replace("1TB", "1T")
+    match = re.fullmatch(r"(16|32|64|128|256|512|1T|2T)", value)
     return match.group(1) if match else ""
 
 
@@ -60,8 +62,92 @@ def _model_name(text: str) -> str:
     return f"iPhone {value}".replace("  ", " ").strip()
 
 
+def _line_positions(values, threshold: int) -> list[int]:
+    import numpy as np
+
+    positions = np.where(values >= threshold)[0]
+    groups: list[list[int]] = []
+    for value in positions:
+        value = int(value)
+        if not groups or value > groups[-1][-1] + 1:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return [round(sum(group) / len(group)) for group in groups]
+
+
+def _dedupe_tokens(tokens: list[dict]) -> list[dict]:
+    result: list[dict] = []
+    for token in sorted(tokens, key=lambda item: (item["y"], item["x"], -item["score"])):
+        duplicate = next((item for item in result if item["clean"] == token["clean"] and abs(item["x"] - token["x"]) < 6 and abs(item["y"] - token["y"]) < 8), None)
+        if duplicate:
+            if token["score"] > duplicate["score"]:
+                duplicate.update(token)
+        else:
+            result.append(token)
+    return result
+
+
+def _ocr_crop(engine, crop, scale: float, offset_x: float, offset_y: float) -> list[dict]:
+    import cv2
+
+    if crop.size == 0:
+        return []
+    enlarged = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    result, _ = engine(enlarged)
+    tokens = []
+    for item in result or []:
+        token = _token(item)
+        for key in ("x", "y", "x0", "x1", "y0", "y1"):
+            token[key] /= scale
+        token["x"] += offset_x
+        token["x0"] += offset_x
+        token["x1"] += offset_x
+        token["y"] += offset_y
+        token["y0"] += offset_y
+        token["y1"] += offset_y
+        tokens.append(token)
+    return tokens
+
+
+def _rows_from_tokens(tokens: list[dict], model: str, network_model: str, capacity_bounds: tuple[int, int], condition_columns: tuple[tuple[int, int, str], ...]) -> list[dict]:
+    rows = []
+    capacities = []
+    for token in tokens:
+        capacity = _capacity(token["clean"])
+        if capacity_bounds[0] <= token["x"] <= capacity_bounds[1] and capacity:
+            capacities.append((token, {"1T":"1024GB","2T":"2048GB"}.get(capacity, f"{capacity}GB")))
+    for token, capacity in capacities:
+        prices = {}
+        scores = []
+        for candidate in tokens:
+            if abs(candidate["y"] - token["y"]) > 16:
+                continue
+            digits = re.sub(r"\D", "", candidate["clean"].replace(",", ""))
+            if not 2 <= len(digits) <= 5:
+                continue
+            for left, right, condition in condition_columns:
+                if left <= candidate["x"] < right:
+                    price = int(digits)
+                    if 50 <= price <= 50000:
+                        prices[condition] = price
+                        scores.append(candidate["score"])
+                    break
+        rows.append({
+            "brand": "Apple",
+            "model": model,
+            "networkModel": network_model,
+            "storage": capacity,
+            "prices": prices,
+            "confidence": round(sum(scores + [token["score"]]) / (len(scores) + 1), 3),
+            "sourceY": round(token["y"]),
+        })
+    return rows
+
+
 def recognize_market_sheet(image_path: Path) -> dict:
     import cv2
+    import numpy as np
 
     image = cv2.imread(str(image_path))
     if image is None:
@@ -70,122 +156,139 @@ def recognize_market_sheet(image_path: Path) -> dict:
     if width < 500 or height < 500:
         raise ValueError("报价表图片尺寸太小，请使用完整原图")
 
-    # 超长表格直接整图识别会被OCR缩得过小。只保留报价列，按约900像素
-    # 分段并放大两倍识别，再把坐标还原到原图。
-    tokens = []
-    crop_width = min(width, 625)
-    chunk_height, step = 920, 820
+    # 此报价单是规则表格。旧版按固定高度切长图会在重叠边界漏掉中间容量行。
+    # 先把宽度归一化，再用真实表格线确定“一个型号”和“一个容量”应有的行数；
+    # OCR只处理对应单元格。识别数量与表格线数量不一致时明确判为不完整。
+    if width != 857:
+        ratio = 857 / width
+        image = cv2.resize(image, (857, round(height * ratio)), interpolation=cv2.INTER_CUBIC)
+        height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    dark = gray < 115
+    vertical_lines = _line_positions(dark.sum(axis=0), round(height * .65))
+    if len(vertical_lines) < 11:
+        raise ValueError("报价表竖向单元格不完整，请使用网页中的完整原图")
+    # 有保表在五个普通档位前多一个“高保充新”列；无保表为五档。
+    condition_names = ("高保充新","靓机","小花","大花","外爆","内爆可测") if len(vertical_lines) >= 12 else ("靓机","小花","大花","外爆","内爆可测")
+    model_right, network_right, capacity_right = vertical_lines[1:4]
+    capacity_bounds = (network_right, capacity_right)
+    condition_boundaries = vertical_lines[3:4 + len(condition_names)]
+    condition_columns = tuple((condition_boundaries[index],condition_boundaries[index + 1],name) for index,name in enumerate(condition_names))
+    quote_right = condition_boundaries[-1]
+    row_lines = _line_positions(dark[:, network_right - 5:quote_right + 5].sum(axis=1), round((quote_right - network_right) * .62))
+    full_lines = _line_positions(dark[:, :network_right].sum(axis=1), round(network_right * .78))
+    if len(row_lines) < 5 or len(full_lines) < 3:
+        raise ValueError("报价表格线不完整，请使用网页中的完整原图")
+
+    left_tokens: list[dict] = []
     with OCR_LOCK:
         engine = _engine()
+        chunk_height, step = 920, 820
         for top in range(0, height, step):
             bottom = min(height, top + chunk_height)
-            chunk = image[top:bottom, :crop_width]
-            enlarged = cv2.resize(chunk, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-            result, _ = engine(enlarged)
-            for item in result or []:
-                token = _token(item)
-                token.update({
-                    "x": token["x"] / 2,
-                    "y": token["y"] / 2 + top,
-                    "x0": token["x0"] / 2,
-                    "x1": token["x1"] / 2,
-                    "y0": token["y0"] / 2 + top,
-                    "y1": token["y1"] / 2 + top,
-                })
-                tokens.append(token)
+            left_tokens.extend(_ocr_crop(engine, image[top:bottom, :network_right + 8], 3, 0, top))
             if bottom == height:
                 break
-    if not tokens:
-        raise ValueError("没有从报价表中识别到文字")
-    tokens = [token for token in tokens if token["clean"] and token["score"] >= 0.35]
-    title_text = " ".join(token["text"] for token in tokens[:80])
-    date_match = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})", title_text)
-    captured_on = "-".join((date_match.group(1), date_match.group(2).zfill(2), date_match.group(3).zfill(2))) if date_match else ""
-
-    capacity_rows = []
-    for token in tokens:
-        capacity = _capacity(token["clean"])
-        if 165 <= token["x"] <= 235 and capacity:
-            capacity_rows.append({**token, "capacity": "1024GB" if capacity == "1T" else f"{capacity}GB"})
-
+        left_tokens = _dedupe_tokens([token for token in left_tokens if token["clean"] and token["score"] >= 0.35])
     model_tokens = []
     network_tokens = []
-    left_tokens = sorted((token for token in tokens if token["x"] < 105), key=lambda token: token["y"])
-    combined_left = list(left_tokens)
-    for index, token in enumerate(left_tokens[:-1]):
-        following = left_tokens[index + 1]
+    model_side = sorted((token for token in left_tokens if token["x"] < model_right + 8), key=lambda token: token["y"])
+    combined_left = list(model_side)
+    for index, token in enumerate(model_side[:-1]):
+        following = model_side[index + 1]
         if 3 <= following["y"] - token["y"] <= 48:
             combined_left.append({**token, "text":f"{token['text']} {following['text']}", "clean":_clean(f"{token['text']} {following['text']}"), "y":(token["y"]+following["y"])/2, "score":(token["score"]+following["score"])/2})
-    for token in tokens:
-        if 85 <= token["x"] <= 165:
+    for token in left_tokens:
+        if model_right - 3 <= token["x"] <= network_right + 3:
             match = re.search(r"A\d{4}", token["clean"].upper())
             if match:
                 network_tokens.append({**token, "networkModel": match.group()})
     for token in combined_left:
-        if token["x"] < 105:
+        if token["x"] < model_right + 8:
             model = _model_name(token["text"])
             if model:
                 model_tokens.append({**token, "model": model})
 
-    def nearest(candidates: list[dict], y: float, limit: float = 230) -> dict | None:
-        if not candidates:
-            return None
-        candidate = min(candidates, key=lambda item: abs(item["y"] - y))
-        return candidate if abs(candidate["y"] - y) <= limit else None
-
-    network_model_map = {}
+    model_units = []
     for network in network_tokens:
-        nearby = [model for model in model_tokens if abs(model["y"] - network["y"]) <= 85]
+        nearby = [model for model in model_tokens if abs(model["y"] - network["y"]) <= 90]
         if nearby:
-            # 合并单元格内型号可能被OCR拆成“16 PRO”和“MAX”，优先选择
-            # 同一区域中文字更完整的候选，再把该网络型号下的容量统一。
-            network_model_map[network["networkModel"]] = max(nearby, key=lambda item: (len(item["model"]), item["score"]))
+            model = max(nearby, key=lambda item: (len(item["model"]), item["score"]))
+            model_units.append({"model":model["model"],"networkModel":network["networkModel"],"y":network["y"],"score":(model["score"]+network["score"])/2})
+    model_units = sorted(model_units, key=lambda item: item["y"])
+    if not model_units:
+        raise ValueError("没有识别到型号与网络型号")
 
     rows = []
-    for capacity in capacity_rows:
-        network = nearest(network_tokens, capacity["y"])
-        model = network_model_map.get(network["networkModel"]) if network else nearest(model_tokens, capacity["y"])
-        if not model:
-            continue
-        prices = {}
-        price_scores = []
-        for token in tokens:
-            if abs(token["y"] - capacity["y"]) > 18:
+    incomplete_blocks = []
+    mandatory_conditions = set(condition_names) - {"高保充新"}
+    with OCR_LOCK:
+        engine = _engine()
+        for start, end in zip(full_lines, full_lines[1:]):
+            boundaries = [value for value in row_lines if start <= value <= end]
+            if not boundaries or boundaries[0] != start:
+                boundaries.insert(0,start)
+            if boundaries[-1] != end:
+                boundaries.append(end)
+            if len(boundaries) < 2:
                 continue
-            digits = re.sub(r"\D", "", token["clean"].replace(",", ""))
-            if not 2 <= len(digits) <= 5:
-                continue
-            for left, right, condition in CONDITION_COLUMNS:
-                if left <= token["x"] < right:
-                    price = int(digits)
-                    if 50 <= price <= 50000:
-                        prices[condition] = price
-                        price_scores.append(token["score"])
-                    break
-        if len(prices) < 2:
-            continue
-        rows.append({
-            "brand": "Apple",
-            "model": model["model"],
-            "networkModel": network["networkModel"] if network else "",
-            "storage": capacity["capacity"],
-            "prices": prices,
-            "confidence": round(sum(price_scores + [capacity["score"], model["score"]]) / (len(price_scores) + 2), 3),
-        })
+            block_tokens = _ocr_crop(engine, image[start + 1:end, network_right:quote_right], 2, network_right, start + 1)
+            block_rows = _rows_from_tokens(block_tokens, "", "", capacity_bounds, condition_columns)
+            for row_top, row_bottom in zip(boundaries, boundaries[1:]):
+                if row_bottom - row_top < 20 or row_bottom - row_top > 140:
+                    continue
+                candidates = [row for row in block_rows if row_top < row["sourceY"] < row_bottom]
+                if not candidates or any(not mandatory_conditions.issubset(row["prices"]) for row in candidates):
+                    retry_tokens = _ocr_crop(engine, image[row_top + 1:row_bottom, network_right:quote_right], 3, network_right, row_top + 1)
+                    retry_rows = _rows_from_tokens(retry_tokens, "", "", capacity_bounds, condition_columns)
+                    for retry in retry_rows:
+                        old = next((index for index,row in enumerate(candidates) if row["storage"] == retry["storage"]), None)
+                        if old is None:
+                            candidates.append(retry)
+                        elif (len(retry["prices"]),retry["confidence"]) > (len(candidates[old]["prices"]),candidates[old]["confidence"]):
+                            candidates[old] = retry
+                    if not candidates:
+                        numeric_prices = 0
+                        for token in retry_tokens:
+                            digits = re.sub(r"\D", "", token["clean"])
+                            if 2 <= len(digits) <= 5 and any(left <= token["x"] < right for left,right,_ in condition_columns):
+                                numeric_prices += 1
+                        if numeric_prices >= 3:
+                            incomplete_blocks.append({"rowTop":row_top,"rowBottom":row_bottom,"reason":"有价格但容量未识别"})
+                for candidate in candidates:
+                    unit = min(model_units, key=lambda item: abs(item["y"] - candidate["sourceY"]))
+                    if abs(unit["y"] - candidate["sourceY"]) > 260:
+                        incomplete_blocks.append({"storage":candidate["storage"],"rowTop":row_top,"reason":"容量未匹配到型号"})
+                        continue
+                    candidate["model"] = unit["model"]
+                    candidate["networkModel"] = unit["networkModel"]
+                    rows.append(candidate)
 
+    raw_row_count = len(rows)
     unique = {}
-    for row in rows:
+    for row in sorted(rows, key=lambda item: item["sourceY"]):
         key = (row["model"].lower(), row["storage"])
-        if key not in unique or row["confidence"] > unique[key]["confidence"]:
+        if key not in unique or (len(row["prices"]), row["confidence"]) > (len(unique[key]["prices"]), unique[key]["confidence"]):
             unique[key] = row
-    rows = sorted(unique.values(), key=lambda row: next((token["y"] for token in capacity_rows if token["capacity"] == row["storage"] and nearest(model_tokens, token["y"]) and nearest(model_tokens, token["y"])["model"] == row["model"]), 0))
+    rows = sorted(unique.values(), key=lambda row: row["sourceY"])
+    for row in rows:
+        row.pop("sourceY", None)
     if not rows:
         raise ValueError("没有识别到报价行，请确认图片是完整报价表原图")
+    expected_rows = raw_row_count + len(incomplete_blocks)
+    incomplete_price_rows = [row for row in rows if not mandatory_conditions.issubset(row["prices"])]
+    missing_rows = max(0, expected_rows - len(rows))
+    complete = missing_rows == 0 and not incomplete_blocks and not incomplete_price_rows
     return {
-        "capturedOn": captured_on,
+        "capturedOn": "",
         "rows": rows,
         "rowCount": len(rows),
+        "expectedRowCount": expected_rows,
+        "missingRowCount": missing_rows,
         "quoteCount": sum(len(row["prices"]) for row in rows),
-        "ocrTokenCount": len(tokens),
-        "mode": "local-table-ocr",
+        "conditions": list(condition_names),
+        "complete": complete,
+        "incompleteRows": (incomplete_blocks + [{"model":row["model"],"storage":row["storage"]} for row in incomplete_price_rows])[:30],
+        "ocrTokenCount": len(left_tokens),
+        "mode": "local-grid-cell-ocr",
     }

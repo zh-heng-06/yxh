@@ -16,11 +16,13 @@ def main() -> int:
     owner = Client(args.base)
     owner.call("/api/setup", "POST", {"shopName":"报价表测试店","username":"owner","displayName":"老板","password":"test1234"})
     owner.call("/api/login", "POST", {"username":"owner","password":"test1234"})
-    result = owner.call("/api/market/sheet/recognize", "POST", {"sourceName":"博能二手回收","imageUrl":args.url}, timeout=180)
-    check(result["capturedOn"] == "2026-07-18" and result["rowCount"] >= 60 and result["quoteCount"] >= 300, "长报价表下载、分段OCR与日期识别", f"{result['rowCount']}行/{result['quoteCount']}价")
+    result = owner.call("/api/market/sheet/recognize", "POST", {"sourceName":"博能二手回收","imageUrl":args.url}, timeout=300)
+    check(result["capturedOn"] == "2026-07-18" and result["complete"] and result["rowCount"] == result["expectedRowCount"] == 101 and result["quoteCount"] == 505, "长报价表下载、逐格OCR与完整性校验", f"{result['rowCount']}行/{result['quoteCount']}价")
 
     target = next((row for row in result["rows"] if row["model"].upper() == "IPHONE 16 PRO MAX" and row["storage"] == "256GB"), None)
     check(target is not None and target["prices"].get("靓机") == 5930 and target["prices"].get("内爆可测") == 3700, "关键报价行识别准确", str(target))
+    target_512 = next((row for row in result["rows"] if row["model"].upper() == "IPHONE 16 PRO MAX" and row["storage"] == "512GB"), None)
+    check(target_512 is not None and target_512["prices"].get("靓机") == 6630 and target_512["prices"].get("内爆可测") == 4400, "512GB容量行不再缺失", str(target_512))
 
     selected = result["rows"][:8]
     expected = sum(len(row["prices"]) for row in selected)
