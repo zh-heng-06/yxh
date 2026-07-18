@@ -68,5 +68,9 @@ export class LocalClient {
   printLabel(id){return this.request(`/api/devices/${encodeURIComponent(id)}/print`,{method:"POST",body:{}});}
   sell(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/sell`,{method:"POST",body:data,timeout:10000});}
   events(){return this.request("/api/events");}
+  alerts(){return this.request("/api/alerts");}
+  auditEvents(filters={}){const p=new URLSearchParams(filters);return this.request(`/api/audit-events?${p}`);}
+  createAfterSales(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/after-sales`,{method:"POST",body:data});}
+  resolveAfterSales(id,data){return this.request(`/api/after-sales/${encodeURIComponent(id)}/resolve`,{method:"POST",body:data});}
   access(){return this.request("/api/access");}
 }

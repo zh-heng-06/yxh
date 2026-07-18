@@ -68,7 +68,10 @@ def main() -> int:
     me = owner.call("/api/me")
     check(me["role"] == "owner", "老板登录")
     status = owner.call("/api/status")
-    check(status["database"] == "ok" and "printer" in status and status["lanUrl"], "运行状态接口", str(status["printer"]))
+    check(status["version"] == "1.0.0" and status["database"] == "ok" and "printer" in status and status["lanUrl"] and status["disk"]["freeGB"] > 0, "V1运行状态与磁盘接口", str(status["printer"]))
+    bad_login = Client(args.base)
+    bad_login.call("/api/login", "POST", {"username": "owner", "password": "wrong-password"}, expected=401)
+    check(True, "登录失败安全记录")
 
     screenshot_url = image_data_url(args.screenshot)
     ocr = owner.call("/api/devices/screenshot/recognize", "POST", {"image": screenshot_url})
@@ -133,8 +136,15 @@ def main() -> int:
     owner.call(f"/api/devices/{first_id}/sell", "POST", {"salePrice": 7000}, expected=409)
     check(True, "成交与重复出库保护")
     owner.call(f"/api/devices/{first_id}/return", "POST", {"reason": "自动测试退货", "refundAmount": 7000, "disposition": "restock"})
-    second_sale = owner.call(f"/api/devices/{first_id}/sell", "POST", {"salePrice": 7100, "paymentMethod": "现金", "customerNote": "退货后再售", "giftCase": True, "giftScreenProtector": True, "giftChargingHead": False, "giftCharger": True})
-    check(owner.call(f"/api/devices/{first_id}")["status"] == "sold", "退货重新入库后再次销售")
+    second_sale = owner.call(f"/api/devices/{first_id}/sell", "POST", {"salePrice": 7100, "paymentMethod": "现金", "customerNote": "退货后再售", "giftCase": True, "giftScreenProtector": True, "giftChargingHead": False, "giftCharger": True, "warrantyDays": 30})
+    sold_detail = owner.call(f"/api/devices/{first_id}")
+    check(sold_detail["status"] == "sold" and sold_detail["latestSale"]["warranty_days"] == 30 and sold_detail["latestSale"]["warranty_status"] == "active", "退货再售与30天质保")
+    after_sales = owner.call(f"/api/devices/{first_id}/after-sales", "POST", {"issue": "客户反馈充电慢"}, expected=201)
+    alerts = owner.call("/api/alerts")
+    check(any(item["title"] == "待处理售后" for item in alerts["items"]), "售后待办提醒")
+    owner.call(f"/api/after-sales/{after_sales['id']}/resolve", "POST", {"resolution": "清理充电口后正常", "serviceCost": 20})
+    resolved_detail = owner.call(f"/api/devices/{first_id}")
+    check(resolved_detail["afterSales"][0]["status"] == "resolved" and resolved_detail["afterSales"][0]["service_cost"] == 20, "售后登记与处理闭环")
 
     dashboard = owner.call("/api/dashboard")
     check(dashboard["todaySold"] == 1 and dashboard["todayRevenue"] == 7100 and dashboard["todayProfit"] == 700, "退货冲减后的仪表盘", str(dashboard))
@@ -182,20 +192,26 @@ def main() -> int:
     staff.call("/api/users", expected=403)
     staff.call(f"/api/sales/{second_sale['saleId']}/update", "POST", {"salePrice": 1}, expected=403)
     staff.call(f"/api/market/summary?{market_query}", expected=403)
-    check("purchase_cost" not in staff_detail and "imei" not in staff_detail and "profit" not in staff_ledger["summary"] and "purchase_cost_snapshot" not in staff_ledger["rows"][0] and staff_ledger["rows"][0]["imei"].startswith("••••"), "店员成本、利润与完整IMEI隔离")
+    staff.call("/api/audit-events", expected=403)
+    check("purchase_cost" not in staff_detail and "imei" not in staff_detail and "purchase_cost_snapshot" not in staff_detail["latestSale"] and staff_detail["latestSale"]["imei_snapshot"].startswith("••••") and "service_cost" not in staff_detail["afterSales"][0] and "profit" not in staff_ledger["summary"] and "purchase_cost_snapshot" not in staff_ledger["rows"][0] and staff_ledger["rows"][0]["imei"].startswith("••••"), "店员成本、利润与完整IMEI隔离")
 
     backup = owner.call("/api/backups/create", "POST", {})
     check(any(item["name"] == backup["name"] for item in owner.call("/api/backups")), "手工备份创建与列表")
     imported = owner.call("/api/import/devices.csv", "POST", {"csv": "brand,model,storage,imei,purchaseCost,listPrice,area\nOPPO,Find X8,256GB,356000000000004,3500,4200,C柜\n"})
     check(imported["imported"] == 1 and not imported["errors"], "旧库存CSV导入")
+    check(any(item["action"] == "inventory_csv_import" for item in owner.call("/api/audit-events")), "批量导入审计日志")
     owner.call("/api/backups/restore", "POST", {"name": backup["name"], "confirmation": "RESTORE"})
     restored_devices = owner.call("/api/devices")
     check(len(restored_devices) == 3 and all(item["imei"] != "356000000000004" for item in restored_devices), "备份恢复演练")
 
     events = owner.call("/api/events")
     event_types = {item["event_type"] for item in events}
-    required_events = {"intake", "edit", "photo_add", "reserve", "reservation_cancel", "repair_start", "repair_complete", "sale", "return"}
+    required_events = {"intake", "edit", "photo_add", "reserve", "reservation_cancel", "repair_start", "repair_complete", "sale", "return", "after_sales_open", "after_sales_resolved"}
     check(required_events.issubset(event_types), "关键操作日志完整", ", ".join(sorted(required_events)))
+    audits = owner.call("/api/audit-events")
+    audit_actions = {item["action"] for item in audits}
+    required_audits = {"login_failed", "device_intake", "device_update", "reservation_create", "repair_start", "device_sale", "sale_return", "sale_update", "after_sales_open", "after_sales_resolve", "backup_restore"}
+    check(required_audits.issubset(audit_actions), "系统级审计日志完整", ", ".join(sorted(required_audits)))
     print("RESULT | ALL_AUTOMATED_TESTS_PASSED", flush=True)
     return 0
 

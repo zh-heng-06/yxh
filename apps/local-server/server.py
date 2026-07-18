@@ -9,10 +9,13 @@ import hmac
 import html
 import io
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import mimetypes
 import os
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -62,11 +65,14 @@ except ImportError:
     recognize_market_sheet = None
 
 COOKIE_NAME = "zhanggui_session"
+APP_VERSION = "1.0.0"
 SESSION_DAYS = 30
 PBKDF2_ROUNDS = 260_000
 WRITE_LOCK = threading.Lock()
 BACKUP_LOCK = threading.Lock()
 MARKET_FEED_LOCK = threading.Lock()
+LOGIN_LOCK = threading.Lock()
+LOGIN_FAILURES: dict[str, list[datetime]] = {}
 MARKET_FEED_PAGES = {
     "5041": {"name":"博能二手回收·苹果有保", "url":"https://13994040400.huishoubaojia.com/5041.html", "minimumRows":20},
     "5042": {"name":"博能二手回收·苹果无保", "url":"https://13994040400.huishoubaojia.com/5042.html", "minimumRows":80},
@@ -75,6 +81,34 @@ MARKET_FEED_PAGES = {
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def build_logger() -> logging.Logger:
+    logger = logging.getLogger("zhanggui")
+    if logger.handlers:
+        return logger
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(DATA_DIR / "system.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    return logger
+
+
+LOGGER = build_logger()
+
+
+def audit_insert(db: sqlite3.Connection, *, shop_id: str | None, action: str, summary: str,
+                 actor: dict | None = None, entity_type: str = "", entity_id: str = "",
+                 details: dict | None = None, success: bool = True, client_ip: str = "") -> None:
+    """Append a privacy-limited, immutable business audit record."""
+    db.execute("""insert into audit_events(shop_id,actor_id,actor_name,actor_role,action,entity_type,entity_id,summary,details,success,client_ip,created_at)
+        values(?,?,?,?,?,?,?,?,?,?,?,?)""", (
+        shop_id, actor.get("id") if actor else None, actor.get("display_name", "") if actor else "系统",
+        actor.get("role", "") if actor else "system", action, entity_type, entity_id, summary,
+        json.dumps(details or {}, ensure_ascii=False, separators=(",", ":")), 1 if success else 0,
+        client_ip, now_iso(),
+    ))
 
 
 class StoreConnection(sqlite3.Connection):
@@ -146,6 +180,34 @@ def migrate_db() -> None:
             db.execute("insert into schema_migrations(version,applied_at) values(4,?)", (now_iso(),))
         if 5 not in applied:
             db.execute("insert into schema_migrations(version,applied_at) values(5,?)", (now_iso(),))
+        if 6 not in applied:
+            sales_columns = {row[1] for row in db.execute("pragma table_info(sales)")}
+            if "warranty_days" not in sales_columns:
+                db.execute("alter table sales add column warranty_days integer not null default 30 check (warranty_days between 0 and 3650)")
+            if "warranty_expires_at" not in sales_columns:
+                db.execute("alter table sales add column warranty_expires_at text")
+            db.executescript("""
+                create table if not exists after_sales_cases (
+                  id text primary key, shop_id text not null references shops(id),
+                  device_id text not null references devices(id), sale_id text not null references sales(id),
+                  issue text not null, status text not null default 'open' check(status in ('open','resolved')),
+                  resolution text not null default '', service_cost real not null default 0 check(service_cost>=0),
+                  created_by text not null references users(id), closed_by text references users(id),
+                  created_at text not null, updated_at text not null, closed_at text
+                );
+                create index if not exists after_sales_device_idx on after_sales_cases(device_id,created_at desc);
+                create table if not exists audit_events (
+                  id integer primary key autoincrement, shop_id text references shops(id),
+                  actor_id text references users(id) on delete set null, actor_name text not null default '',
+                  actor_role text not null default '', action text not null, entity_type text not null default '',
+                  entity_id text not null default '', summary text not null, details text not null default '{}',
+                  success integer not null default 1, client_ip text not null default '', created_at text not null
+                );
+                create index if not exists audit_events_shop_time_idx on audit_events(shop_id,created_at desc,id desc);
+                create trigger if not exists audit_events_no_update before update on audit_events begin select raise(abort,'audit events are immutable'); end;
+                create trigger if not exists audit_events_no_delete before delete on audit_events begin select raise(abort,'audit events are immutable'); end;
+            """)
+            db.execute("insert into schema_migrations(version,applied_at) values(6,?)", (now_iso(),))
 
 
 def database_check() -> str:
@@ -231,9 +293,15 @@ def backup_scheduler(stop_event: threading.Event) -> None:
             return
         try:
             path = daily_backup(True)
+            with connect() as db:
+                shops = db.execute("select id from shops").fetchall()
+                for shop in shops:
+                    audit_insert(db, shop_id=shop["id"], action="backup_scheduled", summary=f"19:00自动备份成功：{path.name}")
             print(f"BACKUP_OK: {path.name}")
+            LOGGER.info("scheduled backup succeeded name=%s", path.name)
         except Exception as error:
             print(f"BACKUP_ERROR: {error}", file=sys.stderr)
+            LOGGER.exception("scheduled backup failed")
 
 
 def fetch_public_market_page(page_id: str) -> dict:
@@ -506,6 +574,18 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
 
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "geolocation=(), microphone=()")
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; media-src 'self' blob:")
+        super().end_headers()
+
+    @property
+    def client_ip(self) -> str:
+        return str(self.client_address[0])[:64]
+
     @property
     def path_only(self) -> str:
         return unquote(urlparse(self.path).path)
@@ -574,7 +654,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.send_json(self.current_user())
             if path == "/api/status":
                 user = self.current_user()
-                return self.send_json({"database": database_check(), "printer": printer_state(), "lanUrl": self.phone_url, "backupRetentionDays": 30, "backup": backup_state(), "role": user["role"]})
+                disk = shutil.disk_usage(DB_PATH.parent)
+                return self.send_json({"version": APP_VERSION, "database": database_check(), "printer": printer_state(), "lanUrl": self.phone_url, "backupRetentionDays": 30, "backup": backup_state(), "role": user["role"], "disk": {"freeGB": round(disk.free / 1024**3, 1), "freePercent": round(disk.free / disk.total * 100, 1), "ok": disk.free >= 5 * 1024**3 and disk.free / disk.total >= .1}})
             if path == "/api/backups":
                 return self.send_json(self.list_backups(self.current_user()))
             if path == "/api/users":
@@ -587,6 +668,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.send_json(self.device_detail(self.current_user(), path.split("/")[3]))
             if path == "/api/events":
                 return self.send_json(self.list_events(self.current_user()))
+            if path == "/api/audit-events":
+                return self.send_json(self.list_audit_events(self.current_user()))
+            if path == "/api/alerts":
+                return self.send_json(self.operations_alerts(self.current_user()))
             if path == "/api/reports/summary":
                 return self.send_json(self.report_summary(self.current_user()))
             if path == "/api/ledger":
@@ -620,12 +705,13 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/photos/"):
                 return self.send_device_photo(self.current_user(), path.split("/")[3])
             if path == "/api/health":
-                return self.send_json({"ok": True, "database": str(DB_PATH), "databaseCheck": database_check(), "time": now_iso()})
+                return self.send_json({"ok": True, "version": APP_VERSION, "database": str(DB_PATH), "databaseCheck": database_check(), "time": now_iso()})
             super().do_GET()
         except ApiError as error:
             self.send_json({"error": str(error)}, error.status)
         except Exception as error:
             print(f"API_ERROR {self.path}: {error}", file=sys.stderr)
+            LOGGER.exception("GET failed path=%s ip=%s", self.path, self.client_ip)
             self.send_json({"error": "系统读取失败，请查看电脑服务窗口"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:
@@ -673,6 +759,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.complete_repair(self.current_user(), path.split("/")[3], self.read_json())
             if path.startswith("/api/devices/") and path.endswith("/return"):
                 return self.return_device(self.current_user(), path.split("/")[3], self.read_json())
+            if path.startswith("/api/devices/") and path.endswith("/after-sales"):
+                return self.create_after_sales(self.current_user(), path.split("/")[3], self.read_json())
+            if path.startswith("/api/after-sales/") and path.endswith("/resolve"):
+                return self.resolve_after_sales(self.current_user(), path.split("/")[3], self.read_json())
             if path.startswith("/api/devices/") and path.endswith("/photos"):
                 return self.add_device_photo(self.current_user(), path.split("/")[3], self.read_json(15_000_000))
             if path == "/api/stocktakes/start": return self.start_stocktake(self.current_user(), self.read_json())
@@ -697,6 +787,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             self.send_json({"error": message}, HTTPStatus.CONFLICT)
         except Exception as error:
             print(f"API_ERROR {self.path}: {error}", file=sys.stderr)
+            LOGGER.exception("POST failed path=%s ip=%s", self.path, self.client_ip)
             self.send_json({"error": "系统处理失败，请查看电脑服务窗口"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def first_setup(self, data: dict) -> None:
@@ -714,25 +805,48 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 raise ApiError(HTTPStatus.CONFLICT, "系统已经完成首次设置")
             db.execute("insert into shops(id,name,created_at) values(?,?,?)", (shop_id, shop_name, stamp))
             db.execute("insert into users(id,shop_id,username,display_name,role,password_hash,password_salt,created_at) values(?,?,?,?,?,?,?,?)", (user_id, shop_id, username, display_name, "owner", digest, salt, stamp))
+            audit_insert(db, shop_id=shop_id, action="first_setup", summary="完成门店首次设置", actor={"id": user_id, "display_name": display_name, "role": "owner"}, entity_type="shop", entity_id=shop_id, client_ip=self.client_ip)
             db.commit()
         self.send_json({"ok": True})
 
     def login(self, data: dict) -> None:
         username, password = str(data.get("username", "")).strip(), str(data.get("password", ""))
+        failure_key = f"{self.client_ip}:{username.lower()}"
+        current = datetime.now(timezone.utc)
+        with LOGIN_LOCK:
+            recent = [stamp for stamp in LOGIN_FAILURES.get(failure_key, []) if current - stamp < timedelta(minutes=15)]
+            LOGIN_FAILURES[failure_key] = recent
+            if len(recent) >= 5:
+                raise ApiError(HTTPStatus.TOO_MANY_REQUESTS, "登录失败次数过多，请15分钟后再试")
+        invalid_login = False
         with connect() as db:
-            row = db.execute("select * from users where username=? collate nocase and active=1", (username,)).fetchone()
-            if not row or not verify_password(password, row["password_hash"], row["password_salt"]):
-                raise ApiError(HTTPStatus.UNAUTHORIZED, "用户名或密码不正确")
-            token = secrets.token_urlsafe(32)
-            expires = (datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds")
-            db.execute("insert into sessions(token_hash,user_id,expires_at,created_at,last_seen_at) values(?,?,?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), row["id"], expires, now_iso(), now_iso()))
+            row = db.execute("select * from users where username=? collate nocase", (username,)).fetchone()
+            if not row or not row["active"] or not verify_password(password, row["password_hash"], row["password_salt"]):
+                with LOGIN_LOCK:
+                    LOGIN_FAILURES.setdefault(failure_key, []).append(current)
+                shop_id = row["shop_id"] if row else (db.execute("select id from shops order by created_at limit 1").fetchone() or [None])[0]
+                audit_insert(db, shop_id=shop_id, action="login_failed", summary=f"登录失败：{username or '空用户名'}", success=False, client_ip=self.client_ip)
+                invalid_login = True
+            else:
+                token = secrets.token_urlsafe(32)
+                expires = (datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds")
+                db.execute("insert into sessions(token_hash,user_id,expires_at,created_at,last_seen_at) values(?,?,?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), row["id"], expires, now_iso(), now_iso()))
+                actor = {"id": row["id"], "display_name": row["display_name"], "role": row["role"]}
+                audit_insert(db, shop_id=row["shop_id"], action="login", summary="登录系统", actor=actor, entity_type="session", client_ip=self.client_ip)
+        if invalid_login:
+            raise ApiError(HTTPStatus.UNAUTHORIZED, "用户名或密码不正确")
+        with LOGIN_LOCK:
+            LOGIN_FAILURES.pop(failure_key, None)
         cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS*86400}"
         self.send_json({"ok": True}, cookie=cookie)
 
     def logout(self) -> None:
+        actor = self.current_user(required=False)
         cookie = SimpleCookie(self.headers.get("Cookie", "")); token = cookie.get(COOKIE_NAME)
         if token:
-            with connect() as db: db.execute("delete from sessions where token_hash=?", (hashlib.sha256(token.value.encode()).hexdigest(),))
+            with connect() as db:
+                db.execute("delete from sessions where token_hash=?", (hashlib.sha256(token.value.encode()).hexdigest(),))
+                if actor: audit_insert(db, shop_id=actor["shop_id"], action="logout", summary="退出系统", actor=actor, entity_type="session", client_ip=self.client_ip)
         self.send_json({"ok": True}, cookie=f"{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
 
     def create_user(self, actor: dict, data: dict) -> None:
@@ -742,7 +856,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
         if not username or not display or len(password) < 6 or role not in ("owner", "staff"):
             raise ApiError(HTTPStatus.BAD_REQUEST, "店员资料不完整")
         digest, salt = hash_password(password)
-        with connect() as db: db.execute("insert into users(id,shop_id,username,display_name,role,password_hash,password_salt,active,created_at) values(?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), actor["shop_id"], username, display, role, digest, salt, 1, now_iso()))
+        user_id = str(uuid.uuid4())
+        with connect() as db:
+            db.execute("insert into users(id,shop_id,username,display_name,role,password_hash,password_salt,active,created_at) values(?,?,?,?,?,?,?,?,?)", (user_id, actor["shop_id"], username, display, role, digest, salt, 1, now_iso()))
+            audit_insert(db, shop_id=actor["shop_id"], action="user_create", summary=f"添加账号：{display}", actor=actor, entity_type="user", entity_id=user_id, details={"username": username, "role": role}, client_ip=self.client_ip)
         self.send_json({"ok": True}, HTTPStatus.CREATED)
 
     def list_users(self, actor: dict) -> list[dict]:
@@ -758,6 +875,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if not row: raise ApiError(HTTPStatus.NOT_FOUND,"没有找到账号")
             active=0 if row["active"] else 1; db.execute("update users set active=? where id=?",(active,user_id))
             if not active: db.execute("delete from sessions where user_id=?",(user_id,))
+            audit_insert(db, shop_id=actor["shop_id"], action="user_toggle", summary=f"{'启用' if active else '停用'}账号", actor=actor, entity_type="user", entity_id=user_id, details={"active": bool(active)}, client_ip=self.client_ip)
         self.send_json({"ok":True,"active":bool(active)})
 
     def change_password(self, actor: dict, data: dict) -> None:
@@ -769,6 +887,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 raise ApiError(HTTPStatus.UNAUTHORIZED, "原密码不正确")
             digest, salt = hash_password(new_password)
             db.execute("update users set password_hash=?,password_salt=? where id=?", (digest, salt, actor["id"]))
+            audit_insert(db, shop_id=actor["shop_id"], action="password_change", summary="修改登录密码", actor=actor, entity_type="user", entity_id=actor["id"], client_ip=self.client_ip)
             db.execute("delete from sessions where user_id=?", (actor["id"],))
         self.send_json({"ok": True}, cookie=f"{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
 
@@ -781,6 +900,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def create_backup(self, actor: dict) -> None:
         if actor["role"] != "owner": raise ApiError(HTTPStatus.FORBIDDEN, "只有老板可以备份")
         path = daily_backup(True)
+        with connect() as db:
+            audit_insert(db, shop_id=actor["shop_id"], action="backup_create", summary=f"手工备份成功：{path.name}", actor=actor, entity_type="backup", entity_id=path.name, client_ip=self.client_ip)
         self.send_json({"ok": True, "name": path.name, "size": path.stat().st_size, "verified": True})
 
     def restore_backup(self, actor: dict, data: dict) -> None:
@@ -798,7 +919,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
             finally:
                 destination.close()
                 source.close()
+        migrate_db()
         database_check()
+        with connect() as db:
+            audit_insert(db, shop_id=actor["shop_id"], action="backup_restore", summary=f"恢复备份：{name}", actor=actor, entity_type="backup", entity_id=name, details={"safetyBackup": safety.name}, client_ip=self.client_ip)
         self.send_json({"ok": True, "restored": name, "safetyBackup": safety.name})
 
     def dashboard(self, user: dict) -> dict:
@@ -818,6 +942,42 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return_impact = db.execute("""select coalesce(sum(case when r.disposition='restock' then r.refund_amount-s.purchase_cost_snapshot else r.refund_amount end),0) from returns r left join sales s on s.id=r.sale_id where r.shop_id=? and date(r.created_at,'localtime')=date('now','localtime')""",(user["shop_id"],)).fetchone()[0]
                 result["todayProfit"] = gross-return_impact
             return result
+
+    def operations_alerts(self, user: dict) -> dict:
+        with connect() as db:
+            aged_rows = db.execute("""select
+                sum(case when julianday('now','localtime')-julianday(d.created_at,'localtime') between 31 and 59.999 then 1 else 0 end) aged_30,
+                sum(case when julianday('now','localtime')-julianday(d.created_at,'localtime') between 60 and 89.999 then 1 else 0 end) aged_60,
+                sum(case when julianday('now','localtime')-julianday(d.created_at,'localtime') >= 90 then 1 else 0 end) aged_90,
+                coalesce(sum(case when julianday('now','localtime')-julianday(d.created_at,'localtime') >= 30 then f.purchase_cost else 0 end),0) aged_capital
+                from devices d left join device_financials f on f.device_id=d.id
+                where d.shop_id=? and d.deleted_at is null and d.status in ('in_stock','reserved')""", (user["shop_id"],)).fetchone()
+            expired = db.execute("""select count(*) from reservations r join devices d on d.id=r.device_id
+                where r.shop_id=? and r.status='active' and r.expires_at is not null and trim(r.expires_at)<>''
+                and datetime(r.expires_at)<datetime('now','localtime') and d.status='reserved'""", (user["shop_id"],)).fetchone()[0]
+            pending = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status='sold_pending_pickup' and julianday('now')-julianday(updated_at)>3", (user["shop_id"],)).fetchone()[0]
+            repairs = db.execute("""select count(*) from repairs r join devices d on d.id=r.device_id where r.shop_id=?
+                and r.status in ('sent','repairing') and d.status='in_repair' and julianday('now')-julianday(r.sent_at)>7""", (user["shop_id"],)).fetchone()[0]
+            after_sales = db.execute("select count(*) from after_sales_cases where shop_id=? and status='open'", (user["shop_id"],)).fetchone()[0]
+        items = []
+        for count, severity, title, message, scope in (
+            (aged_rows["aged_90"] or 0, "danger", "90天以上库存", "优先复检成色和价格，决定降价、同行调拨或止损。", "aged90"),
+            (aged_rows["aged_60"] or 0, "warning", "60–89天库存", "本周逐台检查标价和客户询价记录。", "aged60"),
+            (aged_rows["aged_30"] or 0, "notice", "31–59天库存", "开始重点曝光，避免继续占用资金。", "aged"),
+            (expired, "warning", "预订已到期", "联系客户确认，或取消预订恢复销售。", "reserved"),
+            (pending, "warning", "已售待取超过3天", "联系客户安排取机，避免账物状态不一致。", "pending_pickup"),
+            (repairs, "warning", "送修超过7天", "向维修方追踪进度并更新记录。", "in_repair"),
+            (after_sales, "danger", "待处理售后", "尽快联系客户并记录处理结果。", "sold"),
+        ):
+            if count:
+                items.append({"severity": severity, "title": title, "count": int(count), "message": message, "scope": scope})
+        backup = backup_state()
+        if not backup.get("verified"):
+            items.insert(0, {"severity": "danger", "title": "备份需要检查", "count": 1, "message": "请在设置中立即备份，确认显示校验通过。", "scope": ""})
+        result = {"items": items, "count": sum(int(item["count"]) for item in items), "generatedAt": now_iso()}
+        if user["role"] == "owner":
+            result["agedCapital"] = float(aged_rows["aged_capital"] or 0)
+        return result
 
     def recognize_screenshot(self, user: dict, data: dict) -> None:
         if recognize_device_screenshot is None:
@@ -873,6 +1033,9 @@ class StoreHandler(SimpleHTTPRequestHandler):
         elif scope == "in_stock": sql += " and d.status='in_stock'"
         elif scope == "unprinted": sql += " and d.status in ('in_stock','reserved','sold_pending_pickup') and not exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed')"
         elif scope == "aged": sql += " and d.status in ('in_stock','reserved') and julianday('now')-julianday(d.created_at)>30"
+        elif scope == "aged60": sql += " and d.status in ('in_stock','reserved') and julianday('now')-julianday(d.created_at)>=60 and julianday('now')-julianday(d.created_at)<90"
+        elif scope == "aged90": sql += " and d.status in ('in_stock','reserved') and julianday('now')-julianday(d.created_at)>=90"
+        elif scope == "in_repair": sql += " and d.status='in_repair'"
         if text: sql += " and (d.stock_code like ? or d.model like ? or d.imei like ? or d.serial_number like ?)"; args.extend([f"%{text}%"]*4)
         sql += " order by d.created_at desc limit 500"
         with connect() as db: rows = [dict(row) for row in db.execute(sql, args)]
@@ -895,8 +1058,25 @@ class StoreHandler(SimpleHTTPRequestHandler):
             reservation = db.execute("select * from reservations where device_id=? and status='active' order by created_at desc limit 1", (device_id,)).fetchone()
             repair = db.execute("select * from repairs where device_id=? and status in ('sent','repairing') order by sent_at desc limit 1", (device_id,)).fetchone()
             sale = db.execute("select * from sales where device_id=? order by sold_at desc limit 1", (device_id,)).fetchone()
-            result["reservation"] = dict(reservation) if reservation else None; result["repair"] = dict(repair) if repair else None; result["latestSale"] = dict(sale) if sale else None
-        if user["role"] != "owner": result.pop("imei", None); result.pop("imei2", None)
+            cases = [dict(item) for item in db.execute("""select a.*,u.display_name created_by_name,coalesce(c.display_name,'') closed_by_name
+                from after_sales_cases a join users u on u.id=a.created_by left join users c on c.id=a.closed_by
+                where a.device_id=? order by a.created_at desc""", (device_id,))]
+            latest_sale = dict(sale) if sale else None
+            if latest_sale:
+                expires = latest_sale.get("warranty_expires_at")
+                if not expires and latest_sale.get("warranty_days"):
+                    expires = (datetime.fromisoformat(latest_sale["sold_at"]) + timedelta(days=int(latest_sale["warranty_days"]))).isoformat(timespec="seconds")
+                    latest_sale["warranty_expires_at"] = expires
+                latest_sale["warranty_status"] = "none" if not expires else ("active" if datetime.fromisoformat(expires) >= datetime.now(timezone.utc) else "expired")
+            result["reservation"] = dict(reservation) if reservation else None; result["repair"] = dict(repair) if repair else None; result["latestSale"] = latest_sale; result["afterSales"] = cases
+        if user["role"] != "owner":
+            result.pop("imei", None); result.pop("imei2", None)
+            if result.get("latestSale"):
+                result["latestSale"].pop("purchase_cost_snapshot", None)
+                serial = result["latestSale"].get("imei_snapshot", "")
+                result["latestSale"]["imei_snapshot"] = ("••••" + serial[-4:]) if serial else ""
+            for case in result.get("afterSales", []):
+                case.pop("service_cost", None)
         return result
 
     def update_device(self, user: dict, device_id: str, data: dict) -> None:
@@ -915,6 +1095,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if user["role"] == "owner" and "purchaseCost" in data:
                 db.execute("update device_financials set purchase_cost=?,updated_by=?,updated_at=? where device_id=?", (float(data["purchaseCost"]),user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,metadata,actor_id,created_at) values(?,?,?,?,?,?,?,?,?)", (user["shop_id"],device_id,"edit",before["status"],before["status"],"修改设备资料",json.dumps(changes,ensure_ascii=False),user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="device_update", summary=f"修改设备：{before['stock_code']}", actor=user, entity_type="device", entity_id=device_id, details={"fields": list(changes)}, client_ip=self.client_ip)
         self.send_json({"ok": True, "changed": len(changes)})
 
     def change_device_status(self, user: dict, device_id: str, data: dict) -> None:
@@ -928,6 +1109,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if device["status"] == "sold": raise ApiError(HTTPStatus.CONFLICT, "已售设备请通过退货流程改变状态")
             db.execute("update devices set status=?,updated_by=?,updated_at=? where id=?", (target,user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)", (user["shop_id"],device_id,"status_change",device["status"],target,str(data.get("note", "")),user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="device_status", summary=f"{device['stock_code']}：{device['status']} → {target}", actor=user, entity_type="device", entity_id=device_id, client_ip=self.client_ip)
         self.send_json({"ok": True, "status": target})
 
     def reserve_device(self, user: dict, device_id: str, data: dict) -> None:
@@ -940,6 +1122,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.execute("insert into reservations values(?,?,?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()),user["shop_id"],device_id,customer,str(data.get("customerPhone", "")),deposit,data.get("expiresAt") or None,"active",str(data.get("note", "")),user["id"],stamp,stamp))
             db.execute("update devices set status='reserved',updated_by=?,updated_at=? where id=?", (user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,metadata,actor_id,created_at) values(?,?,?,?,?,?,?,?,?)", (user["shop_id"],device_id,"reserve","in_stock","reserved",customer,json.dumps({"deposit":deposit,"expiresAt":data.get("expiresAt")},ensure_ascii=False),user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="reservation_create", summary=f"预订设备：{device['stock_code']}", actor=user, entity_type="device", entity_id=device_id, details={"deposit": deposit}, client_ip=self.client_ip)
         self.send_json({"ok": True})
 
     def cancel_reservation(self, user: dict, device_id: str) -> None:
@@ -950,6 +1133,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.execute("update reservations set status='cancelled',updated_at=? where id=?",(stamp,row["id"]))
             db.execute("update devices set status='in_stock',updated_by=?,updated_at=? where id=?",(user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)",(user["shop_id"],device_id,"reservation_cancel","reserved","in_stock","取消预订",user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="reservation_cancel", summary="取消设备预订", actor=user, entity_type="device", entity_id=device_id, client_ip=self.client_ip)
         self.send_json({"ok":True})
 
     def start_repair(self,user:dict,device_id:str,data:dict)->None:
@@ -962,6 +1146,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.execute("insert into repairs values(?,?,?,?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),user["shop_id"],device_id,str(data.get("vendor","")),issue,float(data.get("cost") or 0),"sent",stamp,None,user["id"],stamp))
             db.execute("update devices set status='in_repair',updated_by=?,updated_at=? where id=?",(user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)",(user["shop_id"],device_id,"repair_start",device["status"],"in_repair",issue,user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="repair_start", summary=f"设备送修：{device['stock_code']}", actor=user, entity_type="device", entity_id=device_id, client_ip=self.client_ip)
         self.send_json({"ok":True})
 
     def complete_repair(self,user:dict,device_id:str,data:dict)->None:
@@ -973,6 +1158,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.execute("update repairs set status='completed',returned_at=?,updated_at=?,cost=? where id=?",(stamp,stamp,float(data.get("cost") or 0),repair["id"]))
             db.execute("update devices set status=?,updated_by=?,updated_at=? where id=?",(target,user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)",(user["shop_id"],device_id,"repair_complete","in_repair",target,str(data.get("note","")),user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="repair_complete", summary=f"维修完成，状态：{target}", actor=user, entity_type="device", entity_id=device_id, details={"cost": float(data.get("cost") or 0)}, client_ip=self.client_ip)
         self.send_json({"ok":True})
 
     def return_device(self,user:dict,device_id:str,data:dict)->None:
@@ -985,7 +1171,47 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.execute("insert into returns values(?,?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),user["shop_id"],device_id,sale["id"],float(data.get("refundAmount") or sale["sale_price"]),reason,disposition,user["id"],stamp))
             db.execute("update devices set status=?,updated_by=?,updated_at=? where id=?",(target,user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,metadata,actor_id,created_at) values(?,?,?,?,?,?,?,?,?)",(user["shop_id"],device_id,"return","sold",target,reason,json.dumps({"refundAmount":data.get("refundAmount") or sale["sale_price"]},ensure_ascii=False),user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="sale_return", summary=f"销售退货：{device['stock_code']}", actor=user, entity_type="sale", entity_id=sale["id"], details={"refundAmount": float(data.get("refundAmount") or sale["sale_price"]), "disposition": disposition}, client_ip=self.client_ip)
         self.send_json({"ok":True,"status":target})
+
+    def create_after_sales(self, user: dict, device_id: str, data: dict) -> None:
+        issue = str(data.get("issue", "")).strip()
+        if not issue:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "请填写客户反馈的问题")
+        stamp, case_id = now_iso(), str(uuid.uuid4())
+        with WRITE_LOCK, connect() as db:
+            device = db.execute("select * from devices where id=? and shop_id=? and deleted_at is null", (device_id, user["shop_id"])).fetchone()
+            sale = db.execute("select * from sales where device_id=? and shop_id=? order by sold_at desc limit 1", (device_id, user["shop_id"])).fetchone()
+            if not device or not sale:
+                raise ApiError(HTTPStatus.CONFLICT, "该设备没有销售记录，不能登记售后")
+            db.execute("""insert into after_sales_cases(id,shop_id,device_id,sale_id,issue,created_by,created_at,updated_at)
+                values(?,?,?,?,?,?,?,?)""", (case_id, user["shop_id"], device_id, sale["id"], issue, user["id"], stamp, stamp))
+            db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)", (user["shop_id"], device_id, "after_sales_open", device["status"], device["status"], issue, user["id"], stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="after_sales_open", summary=f"登记售后：{device['stock_code']}", actor=user, entity_type="after_sales", entity_id=case_id, client_ip=self.client_ip)
+        self.send_json({"ok": True, "id": case_id}, HTTPStatus.CREATED)
+
+    def resolve_after_sales(self, user: dict, case_id: str, data: dict) -> None:
+        resolution = str(data.get("resolution", "")).strip()
+        if not resolution:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "请填写售后处理结果")
+        try:
+            cost = float(data.get("serviceCost") or 0)
+        except (TypeError, ValueError):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "售后成本格式不正确")
+        if cost < 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "售后成本不能小于0")
+        stamp = now_iso()
+        with WRITE_LOCK, connect() as db:
+            case = db.execute("""select a.*,d.stock_code,d.status device_status from after_sales_cases a join devices d on d.id=a.device_id
+                where a.id=? and a.shop_id=?""", (case_id, user["shop_id"])).fetchone()
+            if not case:
+                raise ApiError(HTTPStatus.NOT_FOUND, "没有找到售后记录")
+            if case["status"] != "open":
+                raise ApiError(HTTPStatus.CONFLICT, "这条售后已经处理完成")
+            db.execute("update after_sales_cases set status='resolved',resolution=?,service_cost=?,closed_by=?,closed_at=?,updated_at=? where id=?", (resolution, cost, user["id"], stamp, stamp, case_id))
+            db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,metadata,actor_id,created_at) values(?,?,?,?,?,?,?,?,?)", (user["shop_id"], case["device_id"], "after_sales_resolved", case["device_status"], case["device_status"], resolution, json.dumps({"serviceCost": cost}, ensure_ascii=False), user["id"], stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="after_sales_resolve", summary=f"完成售后：{case['stock_code']}", actor=user, entity_type="after_sales", entity_id=case_id, details={"serviceCost": cost}, client_ip=self.client_ip)
+        self.send_json({"ok": True})
 
     def current_stocktake(self,user:dict)->dict:
         with connect() as db:
@@ -1052,6 +1278,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.execute("""insert into devices(id,shop_id,stock_code,brand,model,storage,color,system_version,battery_health,charge_cycles,condition_grade,list_price,imei,imei2,serial_number,area,notes,source_fields,created_by,updated_by,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (device_id,user["shop_id"],code,data["brand"],data["model"],data["storage"],data.get("color", ""),data.get("systemVersion", ""),data.get("batteryHealth") or None,data.get("chargeCycles") or None,data.get("conditionGrade", ""),list_price,imei,imei2 or None,data.get("serialNumber") or None,data.get("area", "默认区"),data.get("notes", ""),json.dumps(data.get("sourceFields", {}),ensure_ascii=False),user["id"],user["id"],stamp,stamp))
             db.execute("insert into device_financials values(?,?,?,?,?,?)", (device_id,user["shop_id"],purchase_cost,float(data["minimumPrice"]) if data.get("minimumPrice") not in (None, "") else None,user["id"],stamp))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,to_status,actor_id,created_at) values(?,?,?,?,?,?)", (user["shop_id"],device_id,"intake","in_stock",user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="device_intake", summary=f"入库：{code} {data['model']} {data['storage']}", actor=user, entity_type="device", entity_id=device_id, details={"stockCode": code}, client_ip=self.client_ip)
             screenshot_ref = data.get("sourceFields", {}).get("screenshotRef") if isinstance(data.get("sourceFields"), dict) else None
             if screenshot_ref:
                 db.execute("insert into device_photos(id,shop_id,device_id,photo_type,file_path,description,created_by,created_at) values(?,?,?,?,?,?,?,?)", (str(uuid.uuid4()),user["shop_id"],device_id,"inspection_screenshot",str(screenshot_ref),"入库验机截图",user["id"],stamp))
@@ -1063,7 +1290,11 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def sell(self, user: dict, device_id: str, data: dict) -> None:
         try: price = float(data.get("salePrice"))
         except (TypeError, ValueError): raise ApiError(HTTPStatus.BAD_REQUEST, "成交价不正确")
+        try: warranty_days = int(data.get("warrantyDays", 30) or 0)
+        except (TypeError, ValueError): raise ApiError(HTTPStatus.BAD_REQUEST, "质保天数不正确")
+        if warranty_days < 0 or warranty_days > 3650: raise ApiError(HTTPStatus.BAD_REQUEST, "质保天数应在0到3650天之间")
         stamp = now_iso()
+        warranty_expires = (datetime.fromisoformat(stamp) + timedelta(days=warranty_days)).isoformat(timespec="seconds") if warranty_days else None
         with WRITE_LOCK, connect() as db:
             db.execute("begin immediate")
             device = db.execute("select d.*,coalesce(f.purchase_cost,0) purchase_cost from devices d left join device_financials f on f.device_id=d.id where d.id=? and d.shop_id=? and d.deleted_at is null", (device_id,user["shop_id"])).fetchone()
@@ -1071,10 +1302,11 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if device["status"] not in ("in_stock","reserved","sold_pending_pickup"): raise ApiError(HTTPStatus.CONFLICT, "设备当前状态不能出库")
             sale_id = str(uuid.uuid4())
             truthy = lambda value: 1 if str(value).lower() in ("1", "true", "on", "yes") else 0
-            db.execute("""insert into sales(id,shop_id,device_id,sale_price,payment_method,customer_note,sold_by,sold_at,model_snapshot,storage_snapshot,imei_snapshot,purchase_cost_snapshot,gift_case,gift_screen_protector,gift_charging_head,gift_charger)
-                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (sale_id,user["shop_id"],device_id,price,str(data.get("paymentMethod", "")),str(data.get("customerNote", "")),user["id"],stamp,device["model"],device["storage"],device["imei"] or device["serial_number"] or "",device["purchase_cost"],truthy(data.get("giftCase")),truthy(data.get("giftScreenProtector")),truthy(data.get("giftChargingHead")),truthy(data.get("giftCharger"))))
+            db.execute("""insert into sales(id,shop_id,device_id,sale_price,payment_method,customer_note,sold_by,sold_at,model_snapshot,storage_snapshot,imei_snapshot,purchase_cost_snapshot,gift_case,gift_screen_protector,gift_charging_head,gift_charger,warranty_days,warranty_expires_at)
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (sale_id,user["shop_id"],device_id,price,str(data.get("paymentMethod", "")),str(data.get("customerNote", "")),user["id"],stamp,device["model"],device["storage"],device["imei"] or device["serial_number"] or "",device["purchase_cost"],truthy(data.get("giftCase")),truthy(data.get("giftScreenProtector")),truthy(data.get("giftChargingHead")),truthy(data.get("giftCharger")),warranty_days,warranty_expires))
             db.execute("update devices set status='sold',updated_by=?,updated_at=? where id=?", (user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)", (user["shop_id"],device_id,"sale",device["status"],"sold",str(data.get("customerNote", "")),user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="device_sale", summary=f"出库：{device['stock_code']}，成交价{price:g}元", actor=user, entity_type="sale", entity_id=sale_id, details={"stockCode": device["stock_code"], "warrantyDays": warranty_days}, client_ip=self.client_ip)
             db.commit()
         self.send_json({"ok": True, "saleId": sale_id})
 
@@ -1115,9 +1347,11 @@ class StoreHandler(SimpleHTTPRequestHandler):
         truthy = lambda value: 1 if str(value).lower() in ("1", "true", "on", "yes") else 0
         stamp = now_iso()
         with WRITE_LOCK, connect() as db:
+            before = db.execute("select sale_price,payment_method from sales where id=? and shop_id=?", (sale_id, user["shop_id"])).fetchone()
             cursor = db.execute("""update sales set sale_price=?,payment_method=?,customer_note=?,gift_case=?,gift_screen_protector=?,gift_charging_head=?,gift_charger=?,updated_at=?,updated_by=? where id=? and shop_id=?""",
                 (price,str(data.get("paymentMethod","")),str(data.get("customerNote","")),truthy(data.get("giftCase")),truthy(data.get("giftScreenProtector")),truthy(data.get("giftChargingHead")),truthy(data.get("giftCharger")),stamp,user["id"],sale_id,user["shop_id"]))
             if not cursor.rowcount: raise ApiError(HTTPStatus.NOT_FOUND, "没有找到这笔销售记录")
+            audit_insert(db, shop_id=user["shop_id"], action="sale_update", summary="更正销售账目", actor=user, entity_type="sale", entity_id=sale_id, details={"beforePrice": before["sale_price"] if before else None, "afterPrice": price}, client_ip=self.client_ip)
         self.send_json({"ok": True})
 
     def label_payload(self, device: sqlite3.Row) -> dict:
@@ -1176,9 +1410,11 @@ class StoreHandler(SimpleHTTPRequestHandler):
         except ApiError as error:
             with connect() as db:
                 db.execute("update print_jobs set status='failed',error_message=?,finished_at=? where id=?", (str(error), now_iso(), job_id))
+                audit_insert(db, shop_id=user["shop_id"], action="label_print_failed", summary=f"标签打印失败：{device['stock_code']}", actor=user, entity_type="print_job", entity_id=job_id, details={"error": str(error)[:180]}, success=False, client_ip=self.client_ip)
             raise
         with connect() as db:
             db.execute("update print_jobs set status='printed',finished_at=? where id=?", (now_iso(), job_id))
+            audit_insert(db, shop_id=user["shop_id"], action="label_print", summary=f"标签打印成功：{device['stock_code']}", actor=user, entity_type="print_job", entity_id=job_id, client_ip=self.client_ip)
         self.send_json({"ok": True, "jobId": job_id, "status": "printed"})
 
     def send_label_preview(self, user: dict, device_id: str) -> None:
@@ -1217,11 +1453,28 @@ class StoreHandler(SimpleHTTPRequestHandler):
         with connect() as db:
             db.execute("insert into device_photos values(?,?,?,?,?,?,?,?)",(photo_id,user["shop_id"],device_id,"defect",str(path.relative_to(DB_PATH.parent)),description,user["id"],stamp))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) select shop_id,id,'photo_add',status,status,?,?,? from devices where id=?",(description,user["id"],stamp,device_id))
+            audit_insert(db, shop_id=user["shop_id"], action="photo_add", summary="添加设备照片", actor=user, entity_type="device", entity_id=device_id, client_ip=self.client_ip)
         self.send_json({"ok":True,"id":photo_id,"description":description},HTTPStatus.CREATED)
 
     def list_events(self, user: dict) -> list[dict]:
         with connect() as db:
             return [dict(row) for row in db.execute("""select e.*,d.stock_code,d.model,d.storage,u.display_name actor_name from inventory_events e join devices d on d.id=e.device_id join users u on u.id=e.actor_id where e.shop_id=? order by e.created_at desc,e.id desc limit 100""", (user["shop_id"],))]
+
+    def list_audit_events(self, user: dict) -> list[dict]:
+        if user["role"] != "owner":
+            raise ApiError(HTTPStatus.FORBIDDEN, "只有老板可以查看系统日志")
+        query = parse_qs(urlparse(self.path).query)
+        action = query.get("action", [""])[0].strip()
+        text = query.get("q", [""])[0].strip()
+        sql = "select id,actor_name,actor_role,action,entity_type,entity_id,summary,success,client_ip,created_at from audit_events where shop_id=?"
+        args: list = [user["shop_id"]]
+        if action:
+            sql += " and action=?"; args.append(action)
+        if text:
+            sql += " and (summary like ? or actor_name like ?)"; args.extend([f"%{text}%", f"%{text}%"])
+        sql += " order by created_at desc,id desc limit 200"
+        with connect() as db:
+            return [dict(row) for row in db.execute(sql, args)]
 
     def report_summary(self,user:dict)->dict:
         query=parse_qs(urlparse(self.path).query); date_from=query.get("from",[datetime.now().strftime("%Y-%m-01")])[0]; date_to=query.get("to",[datetime.now().strftime("%Y-%m-%d")])[0]
@@ -1638,6 +1891,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
                     db.execute("insert into device_financials values(?,?,?,?,?,?)",(device_id,user["shop_id"],cost,None,user["id"],stamp)); db.execute("insert into inventory_events(shop_id,device_id,event_type,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?)",(user["shop_id"],device_id,"csv_import","in_stock",f"CSV第{index}行",user["id"],stamp)); imported.append({"row":index,"stockCode":code})
                 except (ValueError,sqlite3.IntegrityError) as error:
                     errors.append({"row":index,"error":"IMEI重复" if isinstance(error,sqlite3.IntegrityError) else str(error)})
+            audit_insert(db, shop_id=user["shop_id"], action="inventory_csv_import", summary=f"批量导入库存：成功{len(imported)}条，失败{len(errors)}条", actor=user, entity_type="import", details={"imported": len(imported), "failed": len(errors)}, client_ip=self.client_ip)
         self.send_json({"ok":True,"imported":len(imported),"errors":errors,"items":imported})
 
     def send_qr(self) -> None:
@@ -1680,7 +1934,8 @@ def main() -> None:
         market_thread.start()
         backup_thread = threading.Thread(target=backup_scheduler,args=(service_stop,),name="daily-backup",daemon=True)
         backup_thread.start()
-    print(f"\n掌柜台正式局域网测试系统已启动\n电脑：http://127.0.0.1:{args.port}/\n手机：http://{lan_ip()}:{args.port}/\n")
+    LOGGER.info("server started port=%s database=%s", args.port, DB_PATH)
+    print(f"\n掌柜台第一版已启动\n电脑：http://127.0.0.1:{args.port}/\n手机：http://{lan_ip()}:{args.port}/\n")
     if args.open: threading.Timer(.8,lambda:webbrowser.open(f"http://127.0.0.1:{args.port}/")).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass

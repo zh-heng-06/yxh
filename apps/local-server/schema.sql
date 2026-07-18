@@ -92,10 +92,48 @@ create table if not exists sales (
   gift_screen_protector integer not null default 0,
   gift_charging_head integer not null default 0,
   gift_charger integer not null default 0,
+  warranty_days integer not null default 30 check (warranty_days between 0 and 3650),
+  warranty_expires_at text,
   updated_at text,
   updated_by text references users(id)
 );
 create index if not exists sales_device_idx on sales(device_id, sold_at desc);
+
+create table if not exists after_sales_cases (
+  id text primary key,
+  shop_id text not null references shops(id),
+  device_id text not null references devices(id),
+  sale_id text not null references sales(id),
+  issue text not null,
+  status text not null default 'open' check (status in ('open','resolved')),
+  resolution text not null default '',
+  service_cost real not null default 0 check (service_cost >= 0),
+  created_by text not null references users(id),
+  closed_by text references users(id),
+  created_at text not null,
+  updated_at text not null,
+  closed_at text
+);
+create index if not exists after_sales_device_idx on after_sales_cases(device_id, created_at desc);
+
+create table if not exists audit_events (
+  id integer primary key autoincrement,
+  shop_id text references shops(id),
+  actor_id text references users(id) on delete set null,
+  actor_name text not null default '',
+  actor_role text not null default '',
+  action text not null,
+  entity_type text not null default '',
+  entity_id text not null default '',
+  summary text not null,
+  details text not null default '{}',
+  success integer not null default 1,
+  client_ip text not null default '',
+  created_at text not null
+);
+create index if not exists audit_events_shop_time_idx on audit_events(shop_id, created_at desc, id desc);
+create trigger if not exists audit_events_no_update before update on audit_events begin select raise(abort, 'audit events are immutable'); end;
+create trigger if not exists audit_events_no_delete before delete on audit_events begin select raise(abort, 'audit events are immutable'); end;
 
 create table if not exists schema_migrations (
   version integer primary key,
