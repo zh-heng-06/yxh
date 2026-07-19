@@ -66,6 +66,8 @@ export class LocalClient {
   recognizeScreenshot(image){return this.request("/api/devices/screenshot/recognize",{method:"POST",body:{image},timeout:60000});}
   appleConnectionStatus(){return this.request("/api/device-connect/apple/status",{timeout:10000});}
   readAppleDevice(udid=""){return this.request("/api/device-connect/apple/read",{method:"POST",body:{udid},timeout:45000});}
+  androidConnectionStatus(){return this.request("/api/device-connect/android/status",{timeout:10000});}
+  readAndroidDevice(serial=""){return this.request("/api/device-connect/android/read",{method:"POST",body:{serial},timeout:45000});}
   intake(data){return this.request("/api/devices/intake",{method:"POST",body:data});}
   quickIntake(data){return this.request("/api/devices/quick-intake",{method:"POST",body:data});}
   printLabel(id){return this.request(`/api/devices/${encodeURIComponent(id)}/print`,{method:"POST",body:{}});}

@@ -72,6 +72,11 @@ try:
 except ImportError:
     AppleDeviceError = None
     apple_usb_status = read_apple_usb = None
+try:
+    from android_device import AndroidDeviceError, android_usb_status, read_android_usb
+except ImportError:
+    AndroidDeviceError = None
+    android_usb_status = read_android_usb = None
 
 COOKIE_NAME = "zhanggui_session"
 APP_VERSION = "1.0.0"
@@ -788,6 +793,11 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 if apple_usb_status is None:
                     return self.send_json({"available":False,"state":"dependency_missing","message":"苹果直连组件尚未安装","devices":[]})
                 return self.send_json(apple_usb_status())
+            if path == "/api/device-connect/android/status":
+                self.current_user()
+                if android_usb_status is None:
+                    return self.send_json({"available":False,"state":"dependency_missing","message":"安卓直连组件尚未安装","devices":[]})
+                return self.send_json(android_usb_status())
             if path == "/api/backups":
                 return self.send_json(self.list_backups(self.current_user()))
             if path == "/api/users":
@@ -860,6 +870,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.recognize_screenshot(self.current_user(), self.read_json(15_000_000))
             if path == "/api/device-connect/apple/read":
                 return self.read_connected_apple(self.current_user(), self.read_json())
+            if path == "/api/device-connect/android/read":
+                return self.read_connected_android(self.current_user(), self.read_json())
             if path == "/api/scan/recognize":
                 return self.recognize_qr(self.current_user(), self.read_json(15_000_000))
             if path == "/api/smart/parse-intake":
@@ -1451,6 +1463,18 @@ class StoreHandler(SimpleHTTPRequestHandler):
             status = HTTPStatus.CONFLICT if error.code in {"locked", "trust_required", "trust_denied", "busy"} else HTTPStatus.SERVICE_UNAVAILABLE if error.code in {"dependency_missing", "driver_error"} else HTTPStatus.BAD_REQUEST
             raise ApiError(status, str(error))
         LOGGER.info("apple usb read user=%s device=%s model=%s", user["id"], str(result.get("udid", ""))[-8:], result.get("model", ""))
+        self.send_json(result)
+
+    def read_connected_android(self, user: dict, data: dict) -> None:
+        if read_android_usb is None or AndroidDeviceError is None:
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "安卓直连组件尚未安装，请双击安装安卓连接组件后重启系统")
+        serial = str(data.get("serial") or "").strip() or None
+        try:
+            result = read_android_usb(serial)
+        except AndroidDeviceError as error:
+            status = HTTPStatus.CONFLICT if error.code in {"unauthorized", "offline", "busy"} else HTTPStatus.SERVICE_UNAVAILABLE if error.code in {"dependency_missing", "driver_error"} else HTTPStatus.BAD_REQUEST
+            raise ApiError(status, str(error))
+        LOGGER.info("android usb read user=%s device=%s brand=%s model=%s", user["id"], str(result.get("serial", ""))[-8:], result.get("brand", ""), result.get("model", ""))
         self.send_json(result)
 
     def intake(self, user: dict, data: dict) -> None:

@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=30";
+import { LocalClient } from "./src/local-client.js?v=32";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);

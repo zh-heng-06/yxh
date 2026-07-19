@@ -72,6 +72,8 @@ def main() -> int:
     check(status["version"] == "1.0.0" and status["database"] == "ok" and "printer" in status and status["lanUrl"] and status["disk"]["freeGB"] > 0, "V1运行状态与磁盘接口", str(status["printer"]))
     apple_status = owner.call("/api/device-connect/apple/status")
     check(isinstance(apple_status.get("available"), bool) and isinstance(apple_status.get("devices"), list) and apple_status.get("state"), "苹果USB检测接口状态明确", apple_status.get("state"))
+    android_status = owner.call("/api/device-connect/android/status")
+    check(isinstance(android_status.get("available"), bool) and isinstance(android_status.get("devices"), list) and android_status.get("state"), "安卓/华为USB检测接口状态明确", android_status.get("state"))
     access = owner.call("/api/access")
     desktop_html, desktop_type = owner.call("/", raw=True, extra_headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     mobile_html, mobile_type = owner.call("/", raw=True, extra_headers={"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"})

@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=31";
+import { LocalClient } from "./src/local-client.js?v=32";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
@@ -31,6 +31,7 @@ let ledgerRows = [];
 let marketEvidence = null;
 let marketSheetResult = null;
 let connectedIphone = null;
+let connectedAndroid = null;
 let toastTimer;
 let searchTimer;
 
@@ -388,6 +389,86 @@ async function detectIphone() {
   }
 }
 
+function resetAndroidForm() {
+  connectedAndroid = null;
+  $("#android-form").reset();
+  $("#android-status").className = "ocr-status working";
+  $("#android-status").textContent = "正在检测USB连接的安卓/华为手机…";
+  $("#android-devices").innerHTML = "";
+  $("#android-result").hidden = true;
+  $("#android-fields").hidden = true;
+  $("#android-submit").disabled = true;
+  $("#android-error").textContent = "";
+}
+
+function renderAndroidResult(result) {
+  const values = [
+    ["品牌", result.brand || "需人工确认"],
+    ["型号", result.model || "需人工确认", "wide"],
+    ["容量", result.storage || "需人工确认"],
+    ["系统", result.systemVersion || "未读取"],
+    ["IMEI", result.imei || "需拨号 *#06# 核对", "wide"],
+    ["电池健康", result.batteryHealth == null ? "厂商未开放" : `${result.batteryHealth}%`],
+    ["充电次数", result.chargeCycles == null ? "厂商未开放" : `${result.chargeCycles}次`],
+    ["设备厂商", result.manufacturer || "未读取"],
+  ];
+  $("#android-result").innerHTML = values.map(([label,value,className]) => `<div class="${className || ""}"><small>${label}</small><strong>${esc(value)}</strong></div>`).join("");
+  $("#android-result").hidden = false;
+  const form = $("#android-form");
+  const fields = {brand:result.brand,model:result.model,storage:result.storage,color:result.color,systemVersion:result.systemVersion,batteryHealth:result.batteryHealth,chargeCycles:result.chargeCycles,imei:result.imei,imei2:result.imei2,serialNumber:result.serialNumber};
+  Object.entries(fields).forEach(([key,value]) => { if (form.elements[key]) form.elements[key].value = value ?? ""; });
+  $("#android-fields").hidden = false;
+  $("#android-submit").disabled = false;
+  const warnings = result.warnings?.length ? `；${result.warnings.join("；")}` : "";
+  $("#android-status").className = "ocr-status done";
+  $("#android-status").textContent = `读取完成，请补齐空白项并核对IMEI、颜色、成色和价格${warnings}`;
+  const firstMissing = ["imei", "storage", "color", "purchaseCost"].find(name => !form.elements[name]?.value);
+  (form.elements[firstMissing] || form.elements.purchaseCost).focus();
+}
+
+async function readAndroid(serial) {
+  $("#android-error").textContent = "";
+  $("#android-devices").innerHTML = "";
+  $("#android-status").className = "ocr-status working";
+  $("#android-status").textContent = "正在读取，请保持手机解锁；若手机询问，请点“允许USB调试”…";
+  try {
+    connectedAndroid = await api.readAndroidDevice(serial);
+    renderAndroidResult(connectedAndroid);
+  } catch (error) {
+    connectedAndroid = null;
+    $("#android-status").className = "ocr-status";
+    $("#android-status").textContent = "没有完成读取";
+    $("#android-error").textContent = error.message;
+  }
+}
+
+async function detectAndroid() {
+  connectedAndroid = null;
+  $("#android-result").hidden = true;
+  $("#android-fields").hidden = true;
+  $("#android-submit").disabled = true;
+  $("#android-error").textContent = "";
+  $("#android-devices").innerHTML = "";
+  $("#android-status").className = "ocr-status working";
+  $("#android-status").textContent = "正在检测USB连接的安卓/华为手机…";
+  try {
+    const status = await api.androidConnectionStatus();
+    if (status.state !== "connected") {
+      $("#android-status").className = "ocr-status";
+      $("#android-status").textContent = status.message;
+      return;
+    }
+    if (status.devices.length === 1) return readAndroid(status.devices[0].serial);
+    $("#android-status").className = "ocr-status done";
+    $("#android-status").textContent = "检测到多台安卓手机，请选择本次要入库的手机";
+    $("#android-devices").innerHTML = status.devices.map(device => `<button type="button" data-android-serial="${esc(device.serial)}">读取 ${esc(device.label)}</button>`).join("");
+  } catch (error) {
+    $("#android-status").className = "ocr-status";
+    $("#android-status").textContent = "安卓设备检测失败";
+    $("#android-error").textContent = error.message;
+  }
+}
+
 $("#setup-form").addEventListener("submit", async event => {
   event.preventDefault();
   $("#setup-error").textContent = "";
@@ -577,10 +658,20 @@ $("#iphone-intake").addEventListener("click", () => {
   $("#iphone-dialog").showModal();
   detectIphone();
 });
+$("#android-intake").addEventListener("click", () => {
+  resetAndroidForm();
+  $("#android-dialog").showModal();
+  detectAndroid();
+});
 $("#iphone-retry").addEventListener("click", detectIphone);
 $("#iphone-devices").addEventListener("click", event => {
   const button = event.target.closest("[data-iphone-udid]");
   if (button) readIphone(button.dataset.iphoneUdid);
+});
+$("#android-retry").addEventListener("click", detectAndroid);
+$("#android-devices").addEventListener("click", event => {
+  const button = event.target.closest("[data-android-serial]");
+  if (button) readAndroid(button.dataset.androidSerial);
 });
 function stopScanCamera() {
   scanLoopToken += 1;
@@ -805,6 +896,38 @@ $("#iphone-form").addEventListener("submit", async event => {
     await refresh();
   } catch (error) {
     $("#iphone-error").textContent = error.message;
+  }
+});
+
+$("#android-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!connectedAndroid) return;
+  $("#android-error").textContent = "";
+  const values = Object.fromEntries(new FormData(event.currentTarget));
+  const printAfterIntake = values.printAfterIntake === "on";
+  delete values.printAfterIntake;
+  const data = {
+    ...values,
+    area: values.area || "默认区",
+    sourceFields: connectedAndroid.sourceFields,
+  };
+  try {
+    const result = await intakeWithCostConfirmation(data);
+    $("#android-dialog").close();
+    resetAndroidForm();
+    if (printAfterIntake) {
+      toast(`已直连入库 ${result.stockCode}，正在打印…`);
+      try {
+        await printLabel(result.id);
+      } catch (printError) {
+        toast(`已入库，但打印失败：${printError.message}`);
+      }
+    } else {
+      toast(`安卓/华为直连入库成功：${result.stockCode}`);
+    }
+    await refresh();
+  } catch (error) {
+    $("#android-error").textContent = error.message;
   }
 });
 

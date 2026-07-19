@@ -26,6 +26,7 @@ docs/acceptance/
 apps/local-server/vendor/
 apps/local-server/vendor-ocr/
 apps/local-server/vendor-qr/
+apps/local-server/tools/android-platform-tools/
 
 # 编译与缓存
 __pycache__/
