@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=29";
+import { LocalClient } from "./src/local-client.js?v=30";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
@@ -9,9 +9,9 @@ const statusNames = {
   sold: "已售", in_repair: "送修中", borrowed_for_test: "借出测试",
   peer_transfer: "同行调拨", return_processing: "退货处理中", scrapped: "报废"
 };
-const scopeNames = {today_intake:"今日入库",today_sold:"今日出库 / 已售",reserved:"预订中",pending_pickup:"已售待取",in_stock:"在库手机",unprinted:"待打印标签",aged:"超30天库存",aged60:"60–89天库存",aged90:"90天以上库存",in_repair:"送修中",sold:"已售设备",all:"全部库存"};
-const eventNames = {intake:"入库",csv_import:"批量导入",edit:"修改资料",photo_add:"添加照片",reserve:"预订",reservation_cancel:"取消预订",repair_start:"送修",repair_complete:"维修完成",sale:"出库",return:"销售退货",status_change:"修改状态",after_sales_open:"登记售后",after_sales_resolved:"售后完成"};
-const auditNames = {first_setup:"首次设置",login:"登录",login_failed:"登录失败",logout:"退出",user_create:"添加账号",user_toggle:"账号启停",password_change:"修改密码",backup_create:"手工备份",backup_scheduled:"自动备份",backup_restore:"恢复备份",device_intake:"入库",device_update:"修改设备",device_status:"修改状态",reservation_create:"预订",reservation_cancel:"取消预订",repair_start:"送修",repair_complete:"维修完成",sale_return:"销售退货",device_sale:"出库",sale_update:"更正账目",label_print:"打印标签",label_print_failed:"打印失败",photo_add:"添加照片",after_sales_open:"登记售后",after_sales_resolve:"售后完成",handoff_create:"生成顾客交接卡",handoff_create_failed:"交接卡生成失败",handoff_reissue:"补发顾客交接卡",handoff_void:"作废顾客交接卡",inventory_csv_import:"批量导入"};
+const scopeNames = {today_intake:"今日入库",today_sold:"今日出库 / 已售",pending_completion:"待补全入库",reserved:"预订中",pending_pickup:"已售待取",in_stock:"在库手机",unprinted:"待打印标签",aged:"超30天库存",aged60:"60–89天库存",aged90:"90天以上库存",in_repair:"送修中",sold:"已售设备",all:"全部库存"};
+const eventNames = {intake:"入库",quick_intake:"快速入库",csv_import:"批量导入",edit:"修改资料",photo_add:"添加照片",reserve:"预订",reservation_cancel:"取消预订",repair_start:"送修",repair_complete:"维修完成",sale:"出库",return:"销售退货",status_change:"修改状态",after_sales_open:"登记售后",after_sales_resolved:"售后完成"};
+const auditNames = {first_setup:"首次设置",login:"登录",login_failed:"登录失败",logout:"退出",user_create:"添加账号",user_toggle:"账号启停",password_change:"修改密码",backup_create:"手工备份",backup_scheduled:"自动备份",backup_restore:"恢复备份",device_intake:"入库",device_quick_intake:"快速入库",device_update:"修改设备",device_status:"修改状态",reservation_create:"预订",reservation_cancel:"取消预订",repair_start:"送修",repair_complete:"维修完成",sale_return:"销售退货",device_sale:"出库",sale_update:"更正账目",label_print:"打印标签",label_print_failed:"打印失败",photo_add:"添加照片",after_sales_open:"登记售后",after_sales_resolve:"售后完成",handoff_create:"生成顾客交接卡",handoff_create_failed:"交接卡生成失败",handoff_reissue:"补发顾客交接卡",handoff_void:"作废顾客交接卡",inventory_csv_import:"批量导入"};
 const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
 }[char]));
@@ -119,6 +119,7 @@ async function refresh() {
   $("#today-sold").textContent = dash.todaySold;
   $("#reserved-count").textContent = dash.reservedCount;
   $("#pending-pickup-count").textContent = dash.pendingPickupCount;
+  $("#pending-completion-count").textContent = dash.pendingCompletionCount;
   $("#unprinted-count").textContent = dash.unprintedCount;
   $("#inventory-cost").textContent = user.role === "owner" ? `库存成本 ${money(dash.inventoryCost)}` : "成本仅老板可见";
   $("#today-profit").textContent = user.role === "owner" ? `今日毛利 ${money(dash.todayProfit)}` : "今日毛利仅老板可见";
@@ -127,7 +128,7 @@ async function refresh() {
 }
 
 function render() {
-  const emptyMessage = $("#search").value.trim() ? "没有找到匹配设备" : ({today_intake:"今天还没有入库",today_sold:"今天还没有出库",reserved:"当前没有预订设备",pending_pickup:"当前没有已售待取设备",in_stock:"当前没有在库设备",unprinted:"当前没有待打印标签",aged:"当前没有超30天库存"}[listScope] || "没有库存设备");
+  const emptyMessage = $("#search").value.trim() ? "没有找到匹配设备" : ({today_intake:"今天还没有入库",today_sold:"今天还没有出库",pending_completion:"当前没有待补全设备",reserved:"当前没有预订设备",pending_pickup:"当前没有已售待取设备",in_stock:"当前没有在库设备",unprinted:"当前没有待打印标签",aged:"当前没有超30天库存"}[listScope] || "没有库存设备");
   $("#device-list").innerHTML = devices.length ? devices.map(device => `
     <article class="device" data-id="${device.id}">
       <div class="device-main">
@@ -140,13 +141,13 @@ function render() {
         </span>
         <span>
           <b>${money(device.list_price)}</b>
-          <i class="pill">${statusNames[device.status] || device.status}</i>
+          <i class="pill ${device.intake_state === "pending" ? "pending" : ""}">${device.intake_state === "pending" ? "待补全" : (statusNames[device.status] || device.status)}</i>
           ${user.role === "owner" ? `<small>成本 ${money(device.purchase_cost)}</small>` : ""}
         </span>
       </div>
       <div class="device-actions">
         <button data-action="detail">详情</button>
-        <button data-action="sell" ${["sold", "scrapped"].includes(device.status) ? "disabled" : ""}>出库</button>
+        <button data-action="sell" ${["sold", "scrapped"].includes(device.status) || device.intake_state === "pending" ? "disabled" : ""}>出库</button>
         ${device.print_status === "printed" ? "" : `<button class="print-button" data-action="print">打印标签</button>`}
       </div>
     </article>`).join("") : `<div class="empty">${emptyMessage}</div>`;
@@ -200,14 +201,19 @@ function showHandoff(handoff) {
 async function openDetail(deviceId) {
   const detail = await api.device(deviceId); currentDetail = detail;
   const form = $("#detail-form");
+  if (!$("#completion-block")) {
+    form.querySelector(".form-grid").insertAdjacentHTML("afterend", `<section id="completion-block" class="completion-block" hidden><strong>这台手机由忙时快速入库建立</strong><p>核对验机资料和销售标价后，勾选完成补全。完成前系统会阻止出库。</p><label class="check"><input name="markComplete" type="checkbox"> 我已核对资料，允许出售</label></section>`);
+  }
   $("#detail-title").textContent = `${detail.model} · ${detail.stock_code}`;
   const values = {deviceId:detail.id,model:detail.model,storage:detail.storage,color:detail.color,systemVersion:detail.system_version,batteryHealth:detail.battery_health,chargeCycles:detail.charge_cycles,conditionGrade:detail.condition_grade,listPrice:detail.list_price,area:detail.area,notes:detail.notes};
   Object.entries(values).forEach(([key,value]) => { if(form.elements[key]) form.elements[key].value = value ?? ""; });
+  form.elements.markComplete.checked = false;
+  $("#completion-block").hidden = detail.intake_state !== "pending";
   $("#detail-status").value = detail.status;
   $("#detail-private").innerHTML = detail.imei ? `<section class="settings-block"><strong>IMEI：${esc(detail.imei)}</strong><small>IMEI2：${esc(detail.imei2 || "-")} · 序列号：${esc(detail.serial_number || "-")}</small>${user.role === "owner" ? `<small>收货成本：${money(detail.purchase_cost)}</small>` : ""}</section>` : "";
   $("#detail-photos").innerHTML = detail.photos.map(photo => `<img src="/api/photos/${encodeURIComponent(photo.id)}" alt="${esc(photo.description)}">`).join("");
   $("#detail-events").innerHTML = detail.events.map(item => `<div class="event-row"><strong>${esc(eventNames[item.event_type] || item.event_type)} · ${esc(item.actor_name)}</strong><small>${new Date(item.created_at).toLocaleString("zh-CN")} ${esc(item.note || "")}</small></div>`).join("");
-  $("#workflow-status").textContent = detail.reservation ? `预订客户：${detail.reservation.customer_name}，订金 ${money(detail.reservation.deposit)}` : detail.repair ? `送修：${detail.repair.issue}（${detail.repair.vendor || "未填维修方"}）` : `当前状态：${statusNames[detail.status] || detail.status}`;
+  $("#workflow-status").textContent = detail.intake_state === "pending" ? "待补全：完成验机和销售标价后才能出库" : detail.reservation ? `预订客户：${detail.reservation.customer_name}，订金 ${money(detail.reservation.deposit)}` : detail.repair ? `送修：${detail.repair.issue}（${detail.repair.vendor || "未填维修方"}）` : `当前状态：${statusNames[detail.status] || detail.status}`;
   $("#reserve-device").hidden = detail.status !== "in_stock";
   $("#cancel-reservation").hidden = !detail.reservation;
   $("#repair-device").hidden = ["sold","in_repair"].includes(detail.status);
@@ -570,13 +576,13 @@ function showScanCandidate(device) {
   scanCandidate = device;
   stopScanCamera();
   const imeiTail = device.imei ? String(device.imei).slice(-4) : device.imei_tail || "-";
-  const canSell = ["in_stock","reserved","sold_pending_pickup"].includes(device.status);
+  const canSell = ["in_stock","reserved","sold_pending_pickup"].includes(device.status) && device.intake_state !== "pending";
   $("#scan-device-card").innerHTML = `<article class="scan-device"><div><small>库存编号</small><strong>${esc(device.stock_code)}</strong></div><div><small>当前状态</small><strong>${esc(statusNames[device.status] || device.status)}</strong></div><div class="wide"><small>设备</small><strong>${esc(device.model)} · ${esc(device.storage)}</strong></div><div><small>颜色</small><strong>${esc(device.color || "-")}</strong></div><div><small>电池</small><strong>${device.battery_health ?? "-"}%</strong></div><div><small>IMEI尾号</small><strong>${esc(imeiTail)}</strong></div><div><small>库位</small><strong>${esc(device.area || "-")}</strong></div><div class="wide price"><small>当前标价</small><strong>${money(device.list_price)}</strong></div></article>`;
   const saleForm = $("#scan-sale-form");
   saleForm.elements.deviceId.value = device.id;
   saleForm.elements.salePrice.value = device.list_price;
   $("#scan-confirm-sale").disabled = !canSell;
-  $("#scan-error").textContent = canSell ? "核对设备无误后，再点击确认出库。" : `该设备当前为“${statusNames[device.status] || device.status}”，不能出库。`;
+  $("#scan-error").textContent = canSell ? "核对设备无误后，再点击确认出库。" : device.intake_state === "pending" ? "这台手机仍在待补全，不能出库。" : `该设备当前为“${statusNames[device.status] || device.status}”，不能出库。`;
   $("#scan-camera-panel").hidden = true;
   $("#scan-form").hidden = true;
   $("#scan-match").hidden = false;

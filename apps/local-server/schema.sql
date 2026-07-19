@@ -56,6 +56,7 @@ create table if not exists devices (
   area text not null default '默认区',
   notes text not null default '',
   source_fields text not null default '{}',
+  intake_state text not null default 'complete' check (intake_state in ('pending','complete')),
   created_by text not null references users(id),
   updated_by text not null references users(id),
   created_at text not null,

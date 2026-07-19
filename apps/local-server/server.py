@@ -238,6 +238,12 @@ def migrate_db() -> None:
                 create index if not exists customer_handoff_events_idx on customer_handoff_events(handoff_id,created_at desc,id desc);
             """)
             db.execute("insert into schema_migrations(version,applied_at) values(7,?)", (now_iso(),))
+        if 8 not in applied:
+            device_columns = {row[1] for row in db.execute("pragma table_info(devices)")}
+            if "intake_state" not in device_columns:
+                db.execute("alter table devices add column intake_state text not null default 'complete' check (intake_state in ('pending','complete'))")
+            db.execute("create index if not exists devices_shop_intake_state_idx on devices(shop_id,intake_state) where deleted_at is null")
+            db.execute("insert into schema_migrations(version,applied_at) values(8,?)", (now_iso(),))
 
 
 def database_check() -> str:
@@ -657,8 +663,12 @@ class StoreHandler(SimpleHTTPRequestHandler):
         return unquote(urlparse(self.path).path)
 
     @property
-    def phone_url(self) -> str:
+    def lan_base_url(self) -> str:
         return f"http://{lan_ip()}:{self.server.server_port}/"
+
+    @property
+    def phone_url(self) -> str:
+        return f"{self.lan_base_url}mobile.html"
 
     def send_json(self, payload, status=HTTPStatus.OK, cookie: str | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -834,6 +844,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if path == "/api/import/devices.csv":
                 return self.import_devices_csv(self.current_user(), self.read_json(5_000_000))
             if path == "/api/devices/intake": return self.intake(self.current_user(), self.read_json())
+            if path == "/api/devices/quick-intake": return self.quick_intake(self.current_user(), self.read_json())
             if path.startswith("/api/devices/") and path.endswith("/update"):
                 return self.update_device(self.current_user(), path.split("/")[3], self.read_json())
             if path.startswith("/api/devices/") and path.endswith("/status"):
@@ -1038,10 +1049,11 @@ class StoreHandler(SimpleHTTPRequestHandler):
             reserved = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status='reserved'", (user["shop_id"],)).fetchone()[0]
             pending_pickup = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status='sold_pending_pickup'", (user["shop_id"],)).fetchone()[0]
             unprinted = db.execute("select count(*) from devices d where d.shop_id=? and d.deleted_at is null and d.status in ('in_stock','reserved','sold_pending_pickup') and not exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed')", (user["shop_id"],)).fetchone()[0]
+            pending_completion = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and intake_state='pending'", (user["shop_id"],)).fetchone()[0]
             aged = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status in ('in_stock','reserved') and julianday('now')-julianday(created_at)>30", (user["shop_id"],)).fetchone()[0]
             sold = db.execute("select count(*),coalesce(sum(sale_price),0) from sales where shop_id=? and date(sold_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()
             returned = db.execute("select count(*),coalesce(sum(refund_amount),0) from returns where shop_id=? and date(created_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()
-            result = {"activeCount": active, "todayIntake": today_intake, "reservedCount": reserved, "pendingPickupCount": pending_pickup, "unprintedCount": unprinted, "agedCount": aged, "todaySold": max(0,sold[0]-returned[0]), "todayRevenue": sold[1]-returned[1], "role": user["role"]}
+            result = {"activeCount": active, "todayIntake": today_intake, "reservedCount": reserved, "pendingPickupCount": pending_pickup, "pendingCompletionCount": pending_completion, "unprintedCount": unprinted, "agedCount": aged, "todaySold": max(0,sold[0]-returned[0]), "todayRevenue": sold[1]-returned[1], "role": user["role"]}
             if user["role"] == "owner":
                 result["inventoryCost"] = db.execute("select coalesce(sum(f.purchase_cost),0) from devices d join device_financials f on f.device_id=d.id where d.shop_id=? and d.deleted_at is null and d.status in ('in_stock','reserved','sold_pending_pickup')", (user["shop_id"],)).fetchone()[0]
                 gross = db.execute("select coalesce(sum(s.sale_price-s.purchase_cost_snapshot),0) from sales s where s.shop_id=? and date(s.sold_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()[0]
@@ -1065,8 +1077,10 @@ class StoreHandler(SimpleHTTPRequestHandler):
             repairs = db.execute("""select count(*) from repairs r join devices d on d.id=r.device_id where r.shop_id=?
                 and r.status in ('sent','repairing') and d.status='in_repair' and julianday('now')-julianday(r.sent_at)>7""", (user["shop_id"],)).fetchone()[0]
             after_sales = db.execute("select count(*) from after_sales_cases where shop_id=? and status='open'", (user["shop_id"],)).fetchone()[0]
+            pending_completion = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and intake_state='pending'", (user["shop_id"],)).fetchone()[0]
         items = []
         for count, severity, title, message, scope in (
+            (pending_completion, "warning", "待补全入库", "补齐验机、成色和标价后才能出售。", "pending_completion"),
             (aged_rows["aged_90"] or 0, "danger", "90天以上库存", "优先复检成色和价格，决定降价、同行调拨或止损。", "aged90"),
             (aged_rows["aged_60"] or 0, "warning", "60–89天库存", "本周逐台检查标价和客户询价记录。", "aged60"),
             (aged_rows["aged_30"] or 0, "notice", "31–59天库存", "开始重点曝光，避免继续占用资金。", "aged"),
@@ -1146,6 +1160,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         elif scope == "reserved": sql += " and d.status='reserved'"
         elif scope == "pending_pickup": sql += " and d.status='sold_pending_pickup'"
         elif scope == "in_stock": sql += " and d.status='in_stock'"
+        elif scope == "pending_completion": sql += " and d.intake_state='pending'"
         elif scope == "unprinted": sql += " and d.status in ('in_stock','reserved','sold_pending_pickup') and not exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed')"
         elif scope == "aged": sql += " and d.status in ('in_stock','reserved') and julianday('now')-julianday(d.created_at)>30"
         elif scope == "aged60": sql += " and d.status in ('in_stock','reserved') and julianday('now')-julianday(d.created_at)>=60 and julianday('now')-julianday(d.created_at)<90"
@@ -1199,17 +1214,29 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def update_device(self, user: dict, device_id: str, data: dict) -> None:
         allowed = {"model":"model","storage":"storage","color":"color","systemVersion":"system_version","batteryHealth":"battery_health","chargeCycles":"charge_cycles","conditionGrade":"condition_grade","listPrice":"list_price","area":"area","notes":"notes"}
         values = {column: data[key] for key, column in allowed.items() if key in data}
-        if not values: raise ApiError(HTTPStatus.BAD_REQUEST, "没有需要修改的内容")
+        mark_complete = str(data.get("markComplete", "")).lower() in ("1", "true", "on", "yes")
+        has_purchase_cost = user["role"] == "owner" and "purchaseCost" in data
+        if not values and not mark_complete and not has_purchase_cost: raise ApiError(HTTPStatus.BAD_REQUEST, "没有需要修改的内容")
         if "list_price" in values and float(values["list_price"]) < 0: raise ApiError(HTTPStatus.BAD_REQUEST, "售价不能小于0")
         stamp = now_iso()
         with WRITE_LOCK, connect() as db:
             before = db.execute("select * from devices where id=? and shop_id=? and deleted_at is null", (device_id,user["shop_id"])).fetchone()
             if not before: raise ApiError(HTTPStatus.NOT_FOUND, "没有找到设备")
+            if mark_complete:
+                merged = dict(before)
+                merged.update(values)
+                purchase_row = db.execute("select purchase_cost from device_financials where device_id=?", (device_id,)).fetchone()
+                purchase_value = data.get("purchaseCost") if has_purchase_cost else (purchase_row["purchase_cost"] if purchase_row else None)
+                missing = [label for key,label in (("model","型号"),("storage","容量"),("imei","IMEI")) if not str(merged.get(key) or "").strip()]
+                if merged.get("list_price") is None or float(merged.get("list_price") or 0) <= 0: missing.append("销售标价")
+                if purchase_value is None or float(purchase_value) < 0: missing.append("收货成本")
+                if missing: raise ApiError(HTTPStatus.BAD_REQUEST, "补全失败，还缺少：" + "、".join(missing))
+                values["intake_state"] = "complete"
             changes = {column:{"before":before[column],"after":value} for column,value in values.items() if str(before[column] if before[column] is not None else "") != str(value if value is not None else "")}
-            if not changes: return self.send_json({"ok": True, "changed": 0})
-            assignments = ",".join(f"{column}=?" for column in values)
-            db.execute(f"update devices set {assignments},updated_by=?,updated_at=? where id=?", (*values.values(),user["id"],stamp,device_id))
-            if user["role"] == "owner" and "purchaseCost" in data:
+            if values:
+                assignments = ",".join(f"{column}=?" for column in values)
+                db.execute(f"update devices set {assignments},updated_by=?,updated_at=? where id=?", (*values.values(),user["id"],stamp,device_id))
+            if has_purchase_cost:
                 db.execute("update device_financials set purchase_cost=?,updated_by=?,updated_at=? where device_id=?", (float(data["purchaseCost"]),user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,metadata,actor_id,created_at) values(?,?,?,?,?,?,?,?,?)", (user["shop_id"],device_id,"edit",before["status"],before["status"],"修改设备资料",json.dumps(changes,ensure_ascii=False),user["id"],stamp))
             audit_insert(db, shop_id=user["shop_id"], action="device_update", summary=f"修改设备：{before['stock_code']}", actor=user, entity_type="device", entity_id=device_id, details={"fields": list(changes)}, client_ip=self.client_ip)
@@ -1408,6 +1435,37 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.commit()
         self.send_json({"ok": True, "id": device_id, "stockCode": code}, HTTPStatus.CREATED)
 
+    def quick_intake(self, user: dict, data: dict) -> None:
+        """Record the non-negotiable facts during a rush; inspection is completed later."""
+        required = ("model", "storage", "imei", "purchaseCost")
+        if any(str(data.get(key, "")).strip() == "" for key in required):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "快速入库请填写型号、容量、IMEI和收货成本")
+        imei = re.sub(r"\D", "", str(data.get("imei", "")))
+        if len(imei) != 15:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "IMEI必须是15位数字")
+        try:
+            purchase_cost = float(data.get("purchaseCost"))
+        except (TypeError, ValueError):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "收货成本格式不正确")
+        if purchase_cost < 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "收货成本不能小于0")
+        model = str(data.get("model", "")).strip()
+        brand = str(data.get("brand", "")).strip() or ("Apple" if "iphone" in model.lower() else "其他")
+        storage = str(data.get("storage", "")).strip()
+        stamp, device_id = now_iso(), str(uuid.uuid4())
+        with WRITE_LOCK, connect() as db:
+            db.execute("begin immediate")
+            code = self.next_stock_code(db, user["shop_id"], brand)
+            db.execute("""insert into devices(id,shop_id,stock_code,brand,model,storage,list_price,imei,area,notes,source_fields,intake_state,created_by,updated_by,created_at,updated_at)
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (device_id,user["shop_id"],code,brand,model,storage,0,imei,str(data.get("area") or "待复检区"),str(data.get("notes") or "忙时快速入库，待补全验机资料"),json.dumps({"mode":"quick_intake"},ensure_ascii=False),"pending",user["id"],user["id"],stamp,stamp))
+            db.execute("insert into device_financials values(?,?,?,?,?,?)", (device_id,user["shop_id"],purchase_cost,None,user["id"],stamp))
+            db.execute("insert into inventory_events(shop_id,device_id,event_type,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?)", (user["shop_id"],device_id,"quick_intake","in_stock","忙时快速入库，待复检",user["id"],stamp))
+            payload={"model":f"待复检 {model}","system":"","storage":storage,"battery":None,"serial":imei,"price":"待定","stock_code":code}
+            db.execute("insert into print_jobs(id,shop_id,device_id,payload,requested_by,requested_at) values(?,?,?,?,?,?)", (str(uuid.uuid4()),user["shop_id"],device_id,json.dumps(payload,ensure_ascii=False),user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="device_quick_intake", summary=f"快速入库：{code} {model} {storage}", actor=user, entity_type="device", entity_id=device_id, details={"stockCode":code,"intakeState":"pending"}, client_ip=self.client_ip)
+            db.commit()
+        self.send_json({"ok":True,"id":device_id,"stockCode":code,"intakeState":"pending"}, HTTPStatus.CREATED)
+
     def sell(self, user: dict, device_id: str, data: dict) -> None:
         try: price = float(data.get("salePrice"))
         except (TypeError, ValueError): raise ApiError(HTTPStatus.BAD_REQUEST, "成交价不正确")
@@ -1420,6 +1478,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             db.execute("begin immediate")
             device = db.execute("select d.*,coalesce(f.purchase_cost,0) purchase_cost from devices d left join device_financials f on f.device_id=d.id where d.id=? and d.shop_id=? and d.deleted_at is null", (device_id,user["shop_id"])).fetchone()
             if not device: raise ApiError(HTTPStatus.NOT_FOUND, "没有找到设备")
+            if device["intake_state"] != "complete": raise ApiError(HTTPStatus.CONFLICT, "这台手机仍在待补全，完成验机和标价后才能出库")
             if device["status"] not in ("in_stock","reserved","sold_pending_pickup"): raise ApiError(HTTPStatus.CONFLICT, "设备当前状态不能出库")
             sale_id = str(uuid.uuid4())
             truthy = lambda value: 1 if str(value).lower() in ("1", "true", "on", "yes") else 0
@@ -1443,7 +1502,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         self.send_json(response)
 
     def handoff_links(self, handoff_id: str, handoff_number: str, token: str) -> dict:
-        base = self.phone_url.rstrip("/")
+        base = self.lan_base_url.rstrip("/")
         return {
             "id": handoff_id,
             "number": handoff_number,
@@ -1536,7 +1595,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         self.handoff_by_token(token)
         if qrcode is None:
             raise ApiError(HTTPStatus.NOT_IMPLEMENTED, "二维码组件未安装")
-        target = f"{self.phone_url.rstrip('/')}/handoff.html?t={token}"
+        target = f"{self.lan_base_url.rstrip('/')}/handoff.html?t={token}"
         image = qrcode.make(target, image_factory=qrcode.image.svg.SvgPathImage, border=2)
         output = io.BytesIO(); image.save(output); body = output.getvalue()
         self.send_response(HTTPStatus.OK); self.send_header("Content-Type","image/svg+xml"); self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(body)

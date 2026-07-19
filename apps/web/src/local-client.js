@@ -65,6 +65,7 @@ export class LocalClient {
   recognizeQr(image){return this.request("/api/scan/recognize",{method:"POST",body:{image}});}
   recognizeScreenshot(image){return this.request("/api/devices/screenshot/recognize",{method:"POST",body:{image},timeout:60000});}
   intake(data){return this.request("/api/devices/intake",{method:"POST",body:data});}
+  quickIntake(data){return this.request("/api/devices/quick-intake",{method:"POST",body:data});}
   printLabel(id){return this.request(`/api/devices/${encodeURIComponent(id)}/print`,{method:"POST",body:{}});}
   sell(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/sell`,{method:"POST",body:data,timeout:10000});}
   reissueHandoff(saleId){return this.request(`/api/sales/${encodeURIComponent(saleId)}/handoff/reissue`,{method:"POST",body:{}});}

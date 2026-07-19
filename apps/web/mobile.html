@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#10241a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>掌柜台 · 手机快办</title>
+  <link rel="icon" href="icon.svg">
+  <link rel="stylesheet" href="mobile.css?v=1">
+</head>
+<body>
+  <section id="mobile-setup" class="auth-card" hidden>
+    <p class="eyebrow">首次设置</p><h1>创建门店</h1><p>建议回到电脑端完成首次设置。</p>
+    <a class="button secondary" href="/">打开电脑工作台</a>
+  </section>
+  <section id="mobile-login" class="auth-card" hidden>
+    <p class="eyebrow">手机快办</p><h1>登录门店</h1><p>忙时只保留必须操作。</p>
+    <form id="mobile-login-form"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="primary" type="submit">登录</button></form>
+    <div id="mobile-login-error" class="error"></div>
+  </section>
+
+  <div id="mobile-app" hidden>
+    <header class="mobile-header"><div><p class="eyebrow">手机快办</p><h1 id="mobile-shop-name">掌柜台</h1></div><button id="mobile-logout" class="text-button">退出</button></header>
+    <main>
+      <section class="rush-summary">
+        <div><small>当前库存</small><strong id="m-active">0 台</strong></div>
+        <div><small>今日</small><strong><span id="m-intake">0</span> 入 / <span id="m-sold">0</span> 出</strong></div>
+      </section>
+      <section id="closing-reminder" class="closing-reminder" hidden></section>
+
+      <section id="home-panel" class="panel">
+        <div class="rush-actions">
+          <button class="rush-action scan" data-open="scan-panel"><span>扫</span><strong>扫码出库</strong><small>扫码 → 核对 → 成交</small></button>
+          <button class="rush-action intake" data-open="quick-panel"><span>＋</span><strong>快速入库</strong><small>先记四项，稍后补全</small></button>
+          <button class="rush-action" data-open="search-panel"><span>⌕</span><strong>查库存</strong><small>编号、IMEI、型号</small></button>
+          <button class="rush-action pending" data-open="pending-panel"><span>!</span><strong>待补全</strong><small><b id="m-pending">0</b> 台不能出售</small></button>
+        </div>
+        <section class="today-card"><div><small>预订</small><b id="m-reserved">0</b></div><div><small>待取</small><b id="m-pickup">0</b></div><div><small>待打印</small><b id="m-unprinted">0</b></div></section>
+        <a class="desktop-link" href="/">需要报表、打印、补全资料？打开电脑工作台 →</a>
+      </section>
+
+      <section id="scan-panel" class="panel task-panel" hidden>
+        <div class="panel-title"><button class="back" data-back>←</button><div><p class="eyebrow">最快出库</p><h2>扫一扫出库</h2></div></div>
+        <section id="m-scan-start" class="scan-start">
+          <div class="scan-mark">⌗</div><p>拍摄标签二维码，或直接输入编号</p>
+          <button id="m-scan-photo" class="primary big">打开相机扫码</button>
+          <input id="m-scan-file" type="file" accept="image/*" capture="environment" hidden>
+          <form id="m-scan-form"><label>库存编号 / IMEI / 尾号<input id="m-scan-code" autocomplete="off" placeholder="例如 A260719-001"></label><button type="submit">查找</button></form>
+        </section>
+        <section id="m-sale-match" hidden>
+          <p class="match-ok">已匹配，请看一眼是不是这台</p>
+          <div id="m-device-card"></div>
+          <form id="m-sale-form" class="sale-fast"><input name="deviceId" type="hidden"><label>成交价<input name="salePrice" type="number" min="0" inputmode="decimal" required></label><label>支付方式<select name="paymentMethod"><option>微信</option><option>支付宝</option><option>现金</option><option>银行卡</option><option>其他</option></select></label><input name="warrantyDays" type="hidden" value="30"><div class="confirm-row"><button id="m-rescan" type="button">不是这台</button><button id="m-confirm-sale" class="primary" type="submit">确认出库</button></div><small>默认门店质保30天；赠品和交接细节可在每日账本补充。</small></form>
+        </section>
+        <div id="m-scan-error" class="error"></div>
+      </section>
+
+      <section id="quick-panel" class="panel task-panel" hidden>
+        <div class="panel-title"><button class="back" data-back>←</button><div><p class="eyebrow">忙时先留痕</p><h2>快速入库</h2></div></div>
+        <p class="notice">只记不能丢的四项。系统生成库存编号并标记“待补全”，未补全前不能卖。</p>
+        <form id="quick-form" class="quick-form"><label>型号（大概也可以）<input name="model" placeholder="例如 iPhone 15 Pro" required></label><label>容量<input name="storage" placeholder="例如 256GB" required></label><label>IMEI<input name="imei" inputmode="numeric" pattern="[0-9]{15}" maxlength="15" placeholder="15位数字" required></label><label>收货成本<input name="purchaseCost" type="number" min="0" inputmode="decimal" required></label><label>品牌<select name="brand"><option value="">自动判断</option><option>Apple</option><option>华为</option><option>小米</option><option>OPPO</option><option>vivo</option><option>其他</option></select></label><button id="quick-submit" class="primary big" type="submit">保存并生成待复检标签</button></form>
+        <div id="quick-result" class="result-card" hidden></div><div id="quick-error" class="error"></div>
+      </section>
+
+      <section id="search-panel" class="panel task-panel" hidden>
+        <div class="panel-title"><button class="back" data-back>←</button><div><p class="eyebrow">快速查询</p><h2>查库存</h2></div></div>
+        <form id="m-search-form" class="search-form"><input id="m-search" type="search" placeholder="编号、IMEI、尾号或型号" required><button class="primary">搜索</button></form><div id="m-search-results" class="mobile-list"></div>
+      </section>
+
+      <section id="pending-panel" class="panel task-panel" hidden>
+        <div class="panel-title"><button class="back" data-back>←</button><div><p class="eyebrow">关店前处理</p><h2>待补全入库</h2></div></div>
+        <p class="notice">这些机器已占库存编号，但系统会阻止出库。请在电脑端补齐验机和标价。</p><div id="m-pending-list" class="mobile-list"></div>
+      </section>
+
+      <section id="m-done" class="done-overlay" hidden><div class="done-card"><div class="done-check">✓</div><h2 id="m-done-title">操作成功</h2><p id="m-done-text"></p><a id="m-handoff-link" class="button secondary" target="_blank" rel="noopener" hidden>打开顾客交接卡</a><button id="m-done-home" class="primary">返回首页</button></div></section>
+    </main>
+  </div>
+  <div id="m-toast" class="toast"></div>
+  <script type="module" src="mobile.js?v=1"></script>
+</body></html>
