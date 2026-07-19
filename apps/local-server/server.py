@@ -648,6 +648,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Permissions-Policy", "camera=(self), geolocation=(), microphone=(), usb=()")
+        self.send_header("Vary", "User-Agent, Sec-CH-UA-Mobile")
         self.send_header("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; media-src 'self' blob:")
         super().end_headers()
 
@@ -668,7 +669,27 @@ class StoreHandler(SimpleHTTPRequestHandler):
 
     @property
     def phone_url(self) -> str:
-        return f"{self.lan_base_url}mobile.html"
+        return self.lan_base_url
+
+    def prefers_mobile_layout(self) -> bool:
+        query = parse_qs(urlparse(self.path).query)
+        override = str(query.get("layout", [""])[0]).lower()
+        if override == "desktop":
+            return False
+        if override == "mobile":
+            return True
+        if self.headers.get("Sec-CH-UA-Mobile", "").strip() == "?1":
+            return True
+        agent = self.headers.get("User-Agent", "").lower()
+        return any(token in agent for token in ("iphone", "ipad", "ipod", "android", "mobile", "harmonyos"))
+
+    def serve_layout_entry(self) -> None:
+        original_path = self.path
+        try:
+            self.path = "/mobile.html" if self.prefers_mobile_layout() else "/index.html"
+            super().do_GET()
+        finally:
+            self.path = original_path
 
     def send_json(self, payload, status=HTTPStatus.OK, cookie: str | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -730,6 +751,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             path = self.path_only
+            if path in ("/", "/index.html"):
+                return self.serve_layout_entry()
             if path.startswith("/api/public/handoffs/"):
                 parts = path.strip("/").split("/")
                 if len(parts) == 4:

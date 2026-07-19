@@ -17,9 +17,10 @@ class Client:
         self.base = base.rstrip("/")
         self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
 
-    def call(self, path: str, method: str = "GET", data=None, raw: bool = False, expected: int | tuple[int, ...] = 200, timeout: int = 45):
+    def call(self, path: str, method: str = "GET", data=None, raw: bool = False, expected: int | tuple[int, ...] = 200, timeout: int = 45, extra_headers=None):
         body = None if data is None else json.dumps(data, ensure_ascii=False).encode("utf-8")
         headers = {}
+        headers.update(extra_headers or {})
         if body is not None:
             headers["Content-Type"] = "application/json"
         if method != "GET":
@@ -70,8 +71,10 @@ def main() -> int:
     status = owner.call("/api/status")
     check(status["version"] == "1.0.0" and status["database"] == "ok" and "printer" in status and status["lanUrl"] and status["disk"]["freeGB"] > 0, "V1运行状态与磁盘接口", str(status["printer"]))
     access = owner.call("/api/access")
-    mobile_html, mobile_type = owner.call("/mobile.html", raw=True)
-    check(access["url"].endswith("/mobile.html") and b"mobile.js" in mobile_html and "text/html" in mobile_type, "电脑与手机入口分离", access["url"])
+    desktop_html, desktop_type = owner.call("/", raw=True, extra_headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    mobile_html, mobile_type = owner.call("/", raw=True, extra_headers={"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"})
+    forced_desktop, _ = owner.call("/?layout=desktop", raw=True, extra_headers={"User-Agent":"Mozilla/5.0 (iPhone) Mobile/15E148"})
+    check(access["url"].endswith(":" + args.base.rsplit(":",1)[-1] + "/") and b"app.js" in desktop_html and b"mobile.js" in mobile_html and b"app.js" in forced_desktop and "text/html" in desktop_type and "text/html" in mobile_type, "同一网址自动适配电脑横屏与手机竖屏", access["url"])
     bad_login = Client(args.base)
     bad_login.call("/api/login", "POST", {"username": "owner", "password": "wrong-password"}, expected=401)
     check(True, "登录失败安全记录")
