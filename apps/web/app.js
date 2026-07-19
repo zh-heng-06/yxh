@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=30";
+import { LocalClient } from "./src/local-client.js?v=31";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
@@ -30,6 +30,7 @@ let scanDetector = null;
 let ledgerRows = [];
 let marketEvidence = null;
 let marketSheetResult = null;
+let connectedIphone = null;
 let toastTimer;
 let searchTimer;
 
@@ -308,6 +309,85 @@ function resetScreenshotForm() {
   $("#ocr-status").textContent = "选择截图后会自动识别型号、颜色、系统、电池、充电次数和IMEI。";
 }
 
+function resetIphoneForm() {
+  connectedIphone = null;
+  $("#iphone-form").reset();
+  $("#iphone-status").className = "ocr-status working";
+  $("#iphone-status").textContent = "正在检测USB连接的iPhone…";
+  $("#iphone-devices").innerHTML = "";
+  $("#iphone-result").hidden = true;
+  $("#iphone-fields").hidden = true;
+  $("#iphone-submit").disabled = true;
+  $("#iphone-error").textContent = "";
+}
+
+function renderIphoneResult(result) {
+  const values = [
+    ["型号", result.model, "wide"],
+    ["容量", result.storage || "需人工确认"],
+    ["系统", result.systemVersion || "未读取"],
+    ["IMEI", result.imei || "需人工确认", "wide"],
+    ["电池健康", result.batteryHealth == null ? "未读取" : `${result.batteryHealth}%`],
+    ["充电次数", result.chargeCycles == null ? "未读取" : `${result.chargeCycles}次`],
+    ["销售型号", [result.salesModel, result.salesRegion].filter(Boolean).join(" ") || "未读取"],
+    ["激活状态", result.activationState === "Activated" ? "已激活" : (result.activationState || "未读取")],
+  ];
+  $("#iphone-result").innerHTML = values.map(([label,value,className]) => `<div class="${className || ""}"><small>${label}</small><strong>${esc(value)}</strong></div>`).join("");
+  $("#iphone-result").hidden = false;
+  const form = $("#iphone-form");
+  const fields = {model:result.model,storage:result.storage,color:result.color,systemVersion:result.systemVersion,batteryHealth:result.batteryHealth,chargeCycles:result.chargeCycles,imei:result.imei,imei2:result.imei2,serialNumber:result.serialNumber};
+  Object.entries(fields).forEach(([key,value]) => { if (form.elements[key]) form.elements[key].value = value ?? ""; });
+  $("#iphone-fields").hidden = false;
+  $("#iphone-submit").disabled = false;
+  const warnings = result.warnings?.length ? `；${result.warnings.join("；")}` : "";
+  $("#iphone-status").className = "ocr-status done";
+  $("#iphone-status").textContent = `读取完成，请看机身补颜色、成色和价格后确认入库${warnings}`;
+  (form.elements.color || form.elements.purchaseCost).focus();
+}
+
+async function readIphone(udid) {
+  $("#iphone-error").textContent = "";
+  $("#iphone-devices").innerHTML = "";
+  $("#iphone-status").className = "ocr-status working";
+  $("#iphone-status").textContent = "正在读取，请保持iPhone解锁；若手机询问，请点“信任”并输入锁屏密码…";
+  try {
+    connectedIphone = await api.readAppleDevice(udid);
+    renderIphoneResult(connectedIphone);
+  } catch (error) {
+    connectedIphone = null;
+    $("#iphone-status").className = "ocr-status";
+    $("#iphone-status").textContent = "没有完成读取";
+    $("#iphone-error").textContent = error.message;
+  }
+}
+
+async function detectIphone() {
+  connectedIphone = null;
+  $("#iphone-result").hidden = true;
+  $("#iphone-fields").hidden = true;
+  $("#iphone-submit").disabled = true;
+  $("#iphone-error").textContent = "";
+  $("#iphone-devices").innerHTML = "";
+  $("#iphone-status").className = "ocr-status working";
+  $("#iphone-status").textContent = "正在检测USB连接的iPhone…";
+  try {
+    const status = await api.appleConnectionStatus();
+    if (status.state !== "connected") {
+      $("#iphone-status").className = "ocr-status";
+      $("#iphone-status").textContent = status.message;
+      return;
+    }
+    if (status.devices.length === 1) return readIphone(status.devices[0].udid);
+    $("#iphone-status").className = "ocr-status done";
+    $("#iphone-status").textContent = "检测到多台iPhone，请选择本次要入库的手机";
+    $("#iphone-devices").innerHTML = status.devices.map(device => `<button type="button" data-iphone-udid="${esc(device.udid)}">读取 ${esc(device.label)}</button>`).join("");
+  } catch (error) {
+    $("#iphone-status").className = "ocr-status";
+    $("#iphone-status").textContent = "苹果设备检测失败";
+    $("#iphone-error").textContent = error.message;
+  }
+}
+
 $("#setup-form").addEventListener("submit", async event => {
   event.preventDefault();
   $("#setup-error").textContent = "";
@@ -491,6 +571,16 @@ $("#import-submit").addEventListener("click",async()=>{const file=$("#import-fil
 $("#new-intake").addEventListener("click", () => {
   resetScreenshotForm();
   $("#screenshot-dialog").showModal();
+});
+$("#iphone-intake").addEventListener("click", () => {
+  resetIphoneForm();
+  $("#iphone-dialog").showModal();
+  detectIphone();
+});
+$("#iphone-retry").addEventListener("click", detectIphone);
+$("#iphone-devices").addEventListener("click", event => {
+  const button = event.target.closest("[data-iphone-udid]");
+  if (button) readIphone(button.dataset.iphoneUdid);
 });
 function stopScanCamera() {
   scanLoopToken += 1;
@@ -682,6 +772,39 @@ $("#screenshot-file").addEventListener("change", async event => {
     $("#ocr-status").className = "ocr-status";
     $("#ocr-status").textContent = "没有完成识别";
     $("#screenshot-error").textContent = error.message;
+  }
+});
+
+$("#iphone-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!connectedIphone) return;
+  $("#iphone-error").textContent = "";
+  const values = Object.fromEntries(new FormData(event.currentTarget));
+  const printAfterIntake = values.printAfterIntake === "on";
+  delete values.printAfterIntake;
+  const data = {
+    brand: "Apple",
+    ...values,
+    area: values.area || "默认区",
+    sourceFields: connectedIphone.sourceFields,
+  };
+  try {
+    const result = await intakeWithCostConfirmation(data);
+    $("#iphone-dialog").close();
+    resetIphoneForm();
+    if (printAfterIntake) {
+      toast(`已直连入库 ${result.stockCode}，正在打印…`);
+      try {
+        await printLabel(result.id);
+      } catch (printError) {
+        toast(`已入库，但打印失败：${printError.message}`);
+      }
+    } else {
+      toast(`iPhone直连入库成功：${result.stockCode}`);
+    }
+    await refresh();
+  } catch (error) {
+    $("#iphone-error").textContent = error.message;
   }
 });
 

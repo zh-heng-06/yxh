@@ -67,6 +67,11 @@ try:
     from market_ocr import recognize_market_sheet
 except ImportError:
     recognize_market_sheet = None
+try:
+    from apple_device import AppleDeviceError, apple_usb_status, read_apple_usb
+except ImportError:
+    AppleDeviceError = None
+    apple_usb_status = read_apple_usb = None
 
 COOKIE_NAME = "zhanggui_session"
 APP_VERSION = "1.0.0"
@@ -778,6 +783,11 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 user = self.current_user()
                 disk = shutil.disk_usage(DB_PATH.parent)
                 return self.send_json({"version": APP_VERSION, "database": database_check(), "printer": printer_state(), "lanUrl": self.phone_url, "backupRetentionDays": 30, "backup": backup_state(), "role": user["role"], "disk": {"freeGB": round(disk.free / 1024**3, 1), "freePercent": round(disk.free / disk.total * 100, 1), "ok": disk.free >= 5 * 1024**3 and disk.free / disk.total >= .1}})
+            if path == "/api/device-connect/apple/status":
+                self.current_user()
+                if apple_usb_status is None:
+                    return self.send_json({"available":False,"state":"dependency_missing","message":"苹果直连组件尚未安装","devices":[]})
+                return self.send_json(apple_usb_status())
             if path == "/api/backups":
                 return self.send_json(self.list_backups(self.current_user()))
             if path == "/api/users":
@@ -848,6 +858,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if path == "/api/backups/restore": return self.restore_backup(self.current_user(), self.read_json())
             if path == "/api/devices/screenshot/recognize":
                 return self.recognize_screenshot(self.current_user(), self.read_json(15_000_000))
+            if path == "/api/device-connect/apple/read":
+                return self.read_connected_apple(self.current_user(), self.read_json())
             if path == "/api/scan/recognize":
                 return self.recognize_qr(self.current_user(), self.read_json(15_000_000))
             if path == "/api/smart/parse-intake":
@@ -1428,6 +1440,18 @@ class StoreHandler(SimpleHTTPRequestHandler):
         db.execute("update counters set last_value=last_value+1 where shop_id=? and counter_date=? and prefix=?", (shop_id, day, prefix))
         value = db.execute("select last_value from counters where shop_id=? and counter_date=? and prefix=?", (shop_id, day, prefix)).fetchone()[0]
         return f"{prefix}{datetime.now().strftime('%y%m%d')}-{value:03d}"
+
+    def read_connected_apple(self, user: dict, data: dict) -> None:
+        if read_apple_usb is None or AppleDeviceError is None:
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "苹果直连组件尚未安装，请按部署说明安装依赖后重启系统")
+        udid = str(data.get("udid") or "").strip() or None
+        try:
+            result = read_apple_usb(udid)
+        except AppleDeviceError as error:
+            status = HTTPStatus.CONFLICT if error.code in {"locked", "trust_required", "trust_denied", "busy"} else HTTPStatus.SERVICE_UNAVAILABLE if error.code in {"dependency_missing", "driver_error"} else HTTPStatus.BAD_REQUEST
+            raise ApiError(status, str(error))
+        LOGGER.info("apple usb read user=%s device=%s model=%s", user["id"], str(result.get("udid", ""))[-8:], result.get("model", ""))
+        self.send_json(result)
 
     def intake(self, user: dict, data: dict) -> None:
         required = ("brand","model","storage","imei","purchaseCost","listPrice")
@@ -2353,8 +2377,12 @@ def main() -> None:
     service_stop = threading.Event()
     market_thread = backup_thread = None
     if not args.db:
-        market_thread = threading.Thread(target=market_feed_scheduler,args=(service_stop,),name="market-feed",daemon=True)
-        market_thread.start()
+        # The market center is intentionally paused during the inventory-first
+        # phase. Keep its collector opt-in so a restart cannot repopulate a
+        # deliberately cleared test database or consume resources silently.
+        if os.environ.get("ZHANGGUI_ENABLE_MARKET_FEED") == "1":
+            market_thread = threading.Thread(target=market_feed_scheduler,args=(service_stop,),name="market-feed",daemon=True)
+            market_thread.start()
         backup_thread = threading.Thread(target=backup_scheduler,args=(service_stop,),name="daily-backup",daemon=True)
         backup_thread.start()
     LOGGER.info("server started port=%s database=%s", args.port, DB_PATH)
