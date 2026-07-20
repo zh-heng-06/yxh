@@ -79,7 +79,7 @@ except ImportError:
     android_usb_status = read_android_usb = None
 
 COOKIE_NAME = "zhanggui_session"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 SESSION_HOURS = 12
 PASSWORD_MIN_LENGTH = 10
 PBKDF2_ROUNDS = 600_000
@@ -1289,7 +1289,12 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def list_devices(self, user: dict) -> list[dict]:
         query = parse_qs(urlparse(self.path).query); text = query.get("q", [""])[0].strip(); status = query.get("status", [""])[0]; scope = query.get("scope", [""])[0]
         print_status_sql = "case when exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed') then 'printed' else (select p.status from print_jobs p where p.device_id=d.id order by p.requested_at desc limit 1) end print_status"
-        sql = "select d.*," + print_status_sql + (",f.purchase_cost,f.minimum_price" if user["role"] == "owner" else "") + " from devices d" + (" left join device_financials f on f.device_id=d.id" if user["role"] == "owner" else "") + " where d.shop_id=? and d.deleted_at is null"
+        photo_status_sql = """,(select count(*) from device_photos dp where dp.device_id=d.id) photo_count,
+            (select count(*) from device_photos dp where dp.device_id=d.id and dp.photo_type='front') front_photo_count,
+            (select count(*) from device_photos dp where dp.device_id=d.id and dp.photo_type='back') back_photo_count,
+            (select count(*) from device_photos dp where dp.device_id=d.id and dp.photo_type='frame') frame_photo_count,
+            (select count(*) from device_photos dp where dp.device_id=d.id and dp.photo_type='defect') defect_photo_count"""
+        sql = "select d.*," + print_status_sql + photo_status_sql + (",f.purchase_cost,f.minimum_price" if user["role"] == "owner" else "") + " from devices d" + (" left join device_financials f on f.device_id=d.id" if user["role"] == "owner" else "") + " where d.shop_id=? and d.deleted_at is null"
         args = [user["shop_id"]]
         if status: sql += " and d.status=?"; args.append(status)
         elif scope == "today_intake": sql += " and date(d.created_at,'localtime')=date('now','localtime')"
@@ -2301,29 +2306,45 @@ class StoreHandler(SimpleHTTPRequestHandler):
         return result
 
     def parse_intake_text(self,user:dict,data:dict)->dict:
-        text=str(data.get("text","")).strip()
+        text=str(data.get("text","")).strip()[:4000]
         if not text: raise ApiError(HTTPStatus.BAD_REQUEST,"请先说话或输入描述")
-        compact=re.sub(r"[,，。；;]"," ",text)
-        result={"brand":"其他","model":"","storage":"","color":"","batteryHealth":None,"conditionGrade":"","purchaseCost":"","listPrice":"","imei":""}
-        model_patterns=[(r"(?:苹果|iphone)\s*(\d+\s*(?:pro\s*max|pro|plus|mini)?)","Apple","iPhone "),(r"(华为\s*[A-Za-z0-9一-龥+ -]+)","华为",""),(r"(小米\s*[A-Za-z0-9一-龥+ -]+)","小米",""),(r"(OPPO\s*[A-Za-z0-9+ -]+)","OPPO",""),(r"(vivo\s*[A-Za-z0-9+ -]+)","vivo","")]
+        compact=re.sub(r"[,，。；;：:]"," ",text)
+        result={"brand":"其他","model":"","storage":"","color":"","batteryHealth":None,"chargeCycles":None,"conditionGrade":"","systemVersion":"","area":"","purchaseCost":"","listPrice":"","imei":"","notes":""}
+        boundary=r"(?=\s+(?:32|64|128|256|512|1024|1\s*[tT]|IMEI|串号|成本|收货|进价|卖|售价|标价|特价|电池|充电|系统|颜色|成色|库位|备注)\b|$)"
+        model_patterns=[
+            (r"(?:苹果|iphone)\s*(\d+\s*(?:pro\s*max|pro|max|plus|mini)?)","Apple","iPhone "),
+            (r"(?:华为\s*)?((?:Mate|Pura|nova|Pocket|畅享|麦芒)\s*[A-Za-z0-9+ -]{1,24}?)"+boundary,"华为",""),
+            (r"(?:荣耀\s*)((?:Magic|数字系列|X|Play|畅玩)\s*[A-Za-z0-9+ -]{1,24}?)"+boundary,"荣耀",""),
+            (r"(?:小米\s*)?((?:小米|Redmi|红米)\s*[A-Za-z0-9一-龥+ -]{1,24}?)"+boundary,"小米",""),
+            (r"(?:OPPO\s*)?((?:Find|Reno|A)\s*[A-Za-z0-9+ -]{1,24}?)"+boundary,"OPPO",""),
+            (r"(?:vivo\s*)?((?:X|S|Y|iQOO)\s*[A-Za-z0-9+ -]{1,24}?)"+boundary,"vivo",""),
+            (r"(?:三星|Samsung)\s*([A-Za-z0-9+ -]{1,24}?)"+boundary,"三星","")]
         for pattern,brand,prefix in model_patterns:
             match=re.search(pattern,compact,re.I)
             if match: result["brand"]=brand; result["model"]=(prefix+match.group(1).strip()).replace("  "," "); break
-        storage=re.search(r"\b(32|64|128|256|512|1024)\s*[gG](?:[bB])?\b",compact)
-        if storage: result["storage"]=storage.group(1)+"GB"
+        storage=re.search(r"\b(32|64|128|256|512|1024)\s*[gG](?:[bB])?\b|\b([12])\s*[tT](?:[bB])?\b",compact)
+        if storage: result["storage"]=(storage.group(1)+"GB") if storage.group(1) else (storage.group(2)+"TB")
         for color in ("白色钛金属","原色钛金属","黑色钛金属","沙漠金","远峰蓝","黑色","白色","金色","银色","蓝色","绿色","紫色","红色","粉色"):
             if color in text: result["color"]=color; break
         battery=re.search(r"电池(?:健康)?\s*(\d{1,3})",compact)
         if battery: result["batteryHealth"]=min(100,int(battery.group(1)))
+        cycles=re.search(r"(?:充电|循环)(?:次数)?\s*(\d{1,5})",compact)
+        if cycles: result["chargeCycles"]=int(cycles.group(1))
         condition=re.search(r"(全新|99新|98新|95新|9成新|8成新)",compact)
         if condition: result["conditionGrade"]=condition.group(1)
+        system=re.search(r"(?:系统|iOS|鸿蒙|HarmonyOS|安卓|Android)\s*(?:版本)?\s*([0-9]+(?:\.[0-9A-Za-z]+){0,2})",compact,re.I)
+        if system: result["systemVersion"]=system.group(1)
+        area=re.search(r"(?:库位|放在|位置)\s*([A-Za-z0-9一-龥-]{1,12})",compact)
+        if area: result["area"]=area.group(1)
         cost=re.search(r"(?:成本|收货|进价)\s*(\d+(?:\.\d+)?)",compact)
         price=re.search(r"(?:卖|售价|标价|特价)\s*(\d+(?:\.\d+)?)",compact)
         if cost: result["purchaseCost"]=cost.group(1)
         if price: result["listPrice"]=price.group(1)
         imei=re.search(r"\b(\d{15})\b",compact)
         if imei: result["imei"]=imei.group(1)
-        result["sourceText"]=text; result["mode"]="local-rules"; return result
+        note=re.search(r"(?:备注|瑕疵|外观)\s*([^，。；;]{1,160})",text)
+        if note: result["notes"]=note.group(1).strip()
+        result["sourceText"]=text; result["mode"]="local-rules-v2"; result["requiresConfirmation"]=True; return result
 
     def market_filters(self) -> dict:
         query = parse_qs(urlparse(self.path).query)

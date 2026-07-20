@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#10241a">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <title>掌柜台 · 手机随身工作台</title>
-  <link rel="icon" href="icon.svg"><link rel="stylesheet" href="mobile.css?v=2">
+  <link rel="icon" href="icon.svg"><link rel="stylesheet" href="mobile.css?v=3">
 </head>
 <body>
   <section id="mobile-setup" class="auth-card" hidden><p class="eyebrow">首次设置</p><h1>创建门店</h1><p>请先在店内电脑完成首次设置。</p><a class="button secondary" href="/?layout=desktop">打开电脑工作台</a></section>
@@ -23,7 +23,7 @@
           <button class="rush-action intake featured" data-open="full-panel"><span>＋</span><strong>完整入库</strong><small>入库后立即可售并打印</small></button>
           <button class="rush-action scan" data-open="scan-panel"><span>扫</span><strong>扫码出库</strong><small>扫码 → 核对 → 成交</small></button>
           <button class="rush-action" data-open="quick-panel"><span>急</span><strong>忙时快速入库</strong><small>先记四项，稍后手机补全</small></button>
-          <button class="rush-action" data-open="search-panel"><span>⌕</span><strong>查库存</strong><small>编号、IMEI、型号</small></button>
+          <button class="rush-action" data-open="search-panel"><span>⌕</span><strong>库存列表</strong><small>照片状态、机况与详情</small></button>
           <button class="rush-action pending" data-open="pending-panel"><span>!</span><strong>待补全</strong><small><b id="m-pending">0</b> 台不能出售</small></button>
           <button class="rush-action customer" data-open="customer-panel"><span>客</span><strong>客户记录</strong><small><b id="m-customer-pending">0</b> 条成交待补</small></button>
         </div>
@@ -33,7 +33,13 @@
 
       <section id="full-panel" class="panel task-panel" hidden>
         <div class="panel-title"><button class="back" data-back>←</button><div><p class="eyebrow">直接进入可售库存</p><h2>完整入库</h2></div></div>
-        <p class="notice">六项核心资料必填。保存后自动排队打印；外观照片可紧接着拍，也可稍后补。</p>
+        <section class="voice-intake-card">
+          <div><b>一句话语音入库</b><small>点击手机键盘麦克风，把手机资料一次说完；系统只接收文字，不保存录音。</small></div>
+          <label>手机资料<textarea id="voice-intake-text" rows="6" placeholder="例如：苹果 iPhone 16 Pro Max，256G，黑色，电池85，95新，IMEI 357507790090396，成本5800，标价6500，系统18.5，库位A柜，备注边框小磕碰"></textarea></label>
+          <button id="voice-intake-parse" class="primary big" type="button">识别信息并填入</button>
+          <div id="voice-intake-result" class="voice-result" hidden></div>
+        </section>
+        <p class="notice">识别后请核对六项核心资料，再确认入库。保存后自动排队打印；外观照片可紧接着拍，也可稍后补。</p>
         <form id="full-form" class="stack-form">
           <div class="form-pair"><label>品牌 *<select name="brand" required><option value="">请选择</option><option>Apple</option><option>华为</option><option>荣耀</option><option>小米</option><option>OPPO</option><option>vivo</option><option>三星</option><option>其他</option></select></label><label>型号 *<input name="model" placeholder="例如 iPhone 16 Pro" required></label></div>
           <div class="form-pair"><label>容量 *<input name="storage" placeholder="256GB" required></label><label>IMEI *<input name="imei" inputmode="numeric" pattern="[0-9]{15}" maxlength="15" placeholder="15位数字" required></label></div>
@@ -56,7 +62,7 @@
         <section id="m-sale-match" hidden><p class="match-ok">已匹配，请看一眼是不是这台</p><div id="m-device-card"></div><form id="m-sale-form" class="sale-fast"><input name="deviceId" type="hidden"><label>成交价 *<input name="salePrice" type="number" min="0" inputmode="decimal" required></label><label>支付方式<select name="paymentMethod"><option>微信</option><option>支付宝</option><option>现金</option><option>银行卡</option><option>其他</option></select></label><label>成交 / 客户速记（可选）<textarea name="customerQuickNote" rows="3" placeholder="可点手机键盘麦克风说话。出库后仍会生成一条待补记录"></textarea></label><input name="warrantyDays" type="hidden" value="30"><div class="confirm-row"><button id="m-rescan" type="button">不是这台</button><button id="m-confirm-sale" class="primary" type="submit">确认出库</button></div></form></section><div id="m-scan-error" class="error"></div>
       </section>
 
-      <section id="search-panel" class="panel task-panel" hidden><div class="panel-title"><button class="back" data-back>←</button><div><p class="eyebrow">快速查询</p><h2>查库存</h2></div></div><form id="m-search-form" class="search-form"><input id="m-search" type="search" placeholder="编号、IMEI、尾号或型号" required><button class="primary">搜索</button></form><div id="m-search-results" class="mobile-list"></div></section>
+      <section id="search-panel" class="panel task-panel" hidden><div class="panel-title"><button class="back" data-back>←</button><div><p class="eyebrow">照片状态与简单机况</p><h2>库存列表</h2></div></div><form id="m-search-form" class="search-form"><input id="m-search" type="search" placeholder="编号、IMEI、尾号或型号"><button class="primary">搜索</button></form><p class="inventory-help">不输入关键词时显示全部库存。每台手机都会标明外观是否完成、照片数量和简单描述。</p><div id="m-search-results" class="mobile-list inventory-list"></div></section>
 
       <section id="pending-panel" class="panel task-panel" hidden><div class="panel-title"><button class="back" data-back>←</button><div><p class="eyebrow">手机也能补齐</p><h2>待补全入库</h2></div></div><p class="notice">点一台机器补齐标价和验机资料，保存后即可出售。</p><div id="m-pending-list" class="mobile-list"></div></section>
       <section id="completion-panel" class="panel task-panel" hidden><div class="panel-title"><button class="back" data-open="pending-panel">←</button><div><p class="eyebrow">完成验机</p><h2 id="completion-title">补全设备</h2></div></div><form id="completion-form" class="stack-form"><input name="id" type="hidden"><div class="form-pair"><label>品牌<input name="brand" required></label><label>型号<input name="model" required></label><label>容量<input name="storage" required></label><label>IMEI<input name="imei" inputmode="numeric" maxlength="15" required></label><label>销售标价<input name="listPrice" type="number" min="0" required></label><label>收货成本（仅老板可改）<input name="purchaseCost" type="number" min="0"></label><label>颜色<input name="color"></label><label>成色<input name="conditionGrade"></label><label>系统<input name="systemVersion"></label><label>电池<input name="batteryHealth" type="number" min="0" max="100"></label><label>库位<input name="area"></label></div><label>备注<textarea name="notes" rows="3" placeholder="可点击手机键盘麦克风说话"></textarea></label><button class="primary big">保存并允许出售</button></form><div id="completion-error" class="error"></div></section>
@@ -69,5 +75,5 @@
 
       <section id="m-done" class="done-overlay" hidden><div class="done-card"><div class="done-check">✓</div><h2 id="m-done-title">操作成功</h2><p id="m-done-text"></p><a id="m-handoff-link" class="button secondary" target="_blank" rel="noopener" hidden>打开顾客交接卡</a><button id="m-done-photo" hidden>拍正面、背面和瑕疵图</button><button id="m-done-customer" hidden>记录卖机客户</button><button id="m-done-home" class="primary">返回首页</button></div></section>
     </main>
-  </div><div id="m-toast" class="toast"></div><script type="module" src="mobile.js?v=2"></script>
+  </div><div id="m-toast" class="toast"></div><script type="module" src="mobile.js?v=4"></script>
 </body></html>

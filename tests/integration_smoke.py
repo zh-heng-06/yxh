@@ -69,7 +69,7 @@ def main() -> int:
     me = owner.call("/api/me")
     check(me["role"] == "owner", "老板登录")
     status = owner.call("/api/status")
-    check(status["version"] == "1.1.0" and status["database"] == "ok" and "printer" in status and status["lanUrl"] and status["disk"]["freeGB"] > 0, "V1.1运行状态与磁盘接口", str(status["printer"]))
+    check(status["version"] == "1.1.1" and status["database"] == "ok" and "printer" in status and status["lanUrl"] and status["disk"]["freeGB"] > 0, "V1.1运行状态与磁盘接口", str(status["printer"]))
     apple_status = owner.call("/api/device-connect/apple/status")
     check(isinstance(apple_status.get("available"), bool) and isinstance(apple_status.get("devices"), list) and apple_status.get("state"), "苹果USB检测接口状态明确", apple_status.get("state"))
     android_status = owner.call("/api/device-connect/android/status")

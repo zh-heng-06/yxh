@@ -18,6 +18,10 @@ def main() -> int:
     owner.call("/api/login", "POST", {"username":"owner","password":"test123456"})
     image = image_data_url(args.image)
 
+    voice = owner.call("/api/smart/parse-intake", "POST", {"text":"苹果 iPhone 16 Pro Max 256G 黑色 电池85 充电308次 95新 IMEI 357507790090396 成本5800 标价6500 系统18.5 库位A柜 备注边框小磕碰"})
+    check(voice["model"] == "iPhone 16 Pro Max" and voice["storage"] == "256GB" and voice["imei"] == "357507790090396" and voice["purchaseCost"] == "5800" and voice["listPrice"] == "6500", "手机单框文字识别六项完整入库核心资料")
+    check(voice["batteryHealth"] == 85 and voice["chargeCycles"] == 308 and voice["systemVersion"] == "18.5" and voice["area"] == "A柜" and "小磕碰" in voice["notes"] and voice["requiresConfirmation"], "手机单框文字识别机况并要求人工核对")
+
     full = owner.call("/api/devices/intake", "POST", {"brand":"Apple","model":"iPhone 16 Pro","storage":"256GB","imei":"359000000000001","purchaseCost":5000,"listPrice":5600}, expected=201)
     detail = owner.call(f"/api/devices/{full['id']}")
     check(detail["intake_state"] == "complete" and detail["appearance_status"] == "pending", "完整入库立即可售、外观待拍")
@@ -26,6 +30,8 @@ def main() -> int:
     owner.call(f"/api/devices/{full['id']}/photos", "POST", {"photoType":"front","image":image}, expected=201)
     confirmed = owner.call(f"/api/devices/{full['id']}/appearance/confirm", "POST", {"result":"no_obvious_defect"})
     check(confirmed["appearanceStatus"] == "complete_no_defect", "正背面外观确认与缺图阻止确认")
+    listed = next(row for row in owner.call("/api/devices?scope=all") if row["id"] == full["id"])
+    check(listed["photo_count"] == 2 and listed["front_photo_count"] == 1 and listed["back_photo_count"] == 1 and listed["defect_photo_count"] == 0 and listed["appearance_status"] == "complete_no_defect", "库存列表一次返回外观状态与分类照片数量")
 
     quick = owner.call("/api/devices/quick-intake", "POST", {"model":"Mate 70 Pro","storage":"512GB","imei":"359000000000002","purchaseCost":4200,"brand":"华为"}, expected=201)
     owner.call(f"/api/devices/{quick['id']}/sell", "POST", {"salePrice":5000}, expected=409)
