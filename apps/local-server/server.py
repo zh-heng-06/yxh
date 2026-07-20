@@ -79,7 +79,7 @@ except ImportError:
     android_usb_status = read_android_usb = None
 
 COOKIE_NAME = "zhanggui_session"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 SESSION_HOURS = 12
 PASSWORD_MIN_LENGTH = 10
 PBKDF2_ROUNDS = 600_000

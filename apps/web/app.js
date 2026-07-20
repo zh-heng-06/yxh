@@ -68,14 +68,17 @@ async function loadApp() {
   }
   $("#shop-name").textContent = user.shop_name;
   $("#role-text").textContent = `${user.display_name} · ${roles[user.role]}`;
-  $("#market-button").hidden = user.role !== "owner";
+  $("#market-button").hidden = true;
   await Promise.all([refresh(), refreshSystemStatus()]);
 }
 
 async function refreshSystemStatus() {
   const status = await api.status();
   $("#connection-text").textContent = status.database === "ok" ? "SQLite共享数据库正常" : "数据库需要检查";
-  $("#printer-text").textContent = `打印机：${status.printer.connected ? "NIIMBOT B1 已连接" : status.printer.status}`;
+  const printerText = $("#printer-text");
+  printerText.textContent = `打印机：${status.printer.connected ? "NIIMBOT B1 已连接" : status.printer.status}`;
+  printerText.className = `status-chip ${status.printer.connected ? "" : "warning"}`.trim();
+  $(".compact-status").classList.toggle("database-error", status.database !== "ok");
   $("#system-status").textContent = `版本：V${status.version}；数据库：${status.database}；打印机：${status.printer.status}；手机地址：${status.lanUrl}`;
   $("#disk-status").textContent = `磁盘剩余：${status.disk.freeGB}GB（${status.disk.freePercent}%）${status.disk.ok ? "，正常" : "，请尽快清理或更换硬盘"}`;
   $("#disk-status").className = status.disk.ok ? "backup-ok" : "backup-warning";
@@ -122,17 +125,29 @@ async function refresh() {
   devices = list;
   $("#list-title").textContent = search ? "搜索结果" : (scopeNames[listScope] || "手机库存");
   $("#active-count").textContent = `${dash.activeCount} 台`;
-  $("#aged-count").textContent = dash.agedCount;
   $("#today-intake").textContent = dash.todayIntake;
   $("#today-sold").textContent = dash.todaySold;
-  $("#reserved-count").textContent = dash.reservedCount;
-  $("#pending-pickup-count").textContent = dash.pendingPickupCount;
-  $("#pending-completion-count").textContent = dash.pendingCompletionCount;
-  $("#pending-photos-count").textContent = dash.pendingPhotosCount || 0;
-  $("#pending-customer-count").textContent = dash.pendingCustomerCount || 0;
-  $("#unprinted-count").textContent = dash.unprintedCount;
-  $("#inventory-cost").textContent = user.role === "owner" ? `库存成本 ${money(dash.inventoryCost)}` : "成本仅老板可见";
-  $("#today-profit").textContent = user.role === "owner" ? `今日毛利 ${money(dash.todayProfit)}` : "今日毛利仅老板可见";
+  $("#inventory-cost").textContent = user.role === "owner" ? money(dash.inventoryCost) : "仅老板可见";
+  $("#today-profit").textContent = user.role === "owner" ? money(dash.todayProfit) : "仅老板可见";
+  const taskValues = [
+    ["aged-count", dash.agedCount],
+    ["reserved-count", dash.reservedCount],
+    ["pending-pickup-count", dash.pendingPickupCount],
+    ["pending-completion-count", dash.pendingCompletionCount],
+    ["pending-photos-count", dash.pendingPhotosCount || 0],
+    ["pending-customer-count", dash.pendingCustomerCount || 0],
+    ["unprinted-count", dash.unprintedCount]
+  ];
+  let taskTotal = 0, taskKinds = 0;
+  for (const [id, rawValue] of taskValues) {
+    const value = Number(rawValue || 0), node = $(`#${id}`), card = node.closest(".metric-card");
+    node.textContent = value;
+    card.classList.toggle("is-zero", value === 0);
+    card.classList.toggle("needs-attention", value > 0);
+    taskTotal += value;
+    if (value > 0) taskKinds += 1;
+  }
+  $("#task-summary").textContent = taskKinds ? `${taskKinds} 类待办，共 ${taskTotal} 项` : "今天没有未完成事项";
   renderAlerts(alerts);
   render();
 }
@@ -160,7 +175,7 @@ function render() {
         <button data-action="sell" ${["sold", "scrapped"].includes(device.status) || device.intake_state === "pending" ? "disabled" : ""}>出库</button>
         ${device.print_status === "printed" ? "" : `<button class="print-button" data-action="print">打印标签</button>`}
       </div>
-    </article>`).join("") : `<div class="empty">${emptyMessage}</div>`;
+    </article>`).join("") : `<div class="empty"><strong>${emptyMessage}</strong><small>${$("#search").value.trim() ? "换一个型号、编号或IMEI尾号再试试" : listScope === "today_intake" ? "新设备入库后会立即显示在这里" : "当前不需要处理这一项"}</small></div>`;
 }
 
 async function printLabel(deviceId, button) {
