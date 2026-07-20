@@ -1,4 +1,4 @@
-import { LocalClient } from "./src/local-client.js?v=32";
+import { LocalClient } from "./src/local-client.js?v=33";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
@@ -9,9 +9,9 @@ const statusNames = {
   sold: "已售", in_repair: "送修中", borrowed_for_test: "借出测试",
   peer_transfer: "同行调拨", return_processing: "退货处理中", scrapped: "报废"
 };
-const scopeNames = {today_intake:"今日入库",today_sold:"今日出库 / 已售",pending_completion:"待补全入库",reserved:"预订中",pending_pickup:"已售待取",in_stock:"在库手机",unprinted:"待打印标签",aged:"超30天库存",aged60:"60–89天库存",aged90:"90天以上库存",in_repair:"送修中",sold:"已售设备",all:"全部库存"};
-const eventNames = {intake:"入库",quick_intake:"快速入库",csv_import:"批量导入",edit:"修改资料",photo_add:"添加照片",reserve:"预订",reservation_cancel:"取消预订",repair_start:"送修",repair_complete:"维修完成",sale:"出库",return:"销售退货",status_change:"修改状态",after_sales_open:"登记售后",after_sales_resolved:"售后完成"};
-const auditNames = {first_setup:"首次设置",login:"登录",login_failed:"登录失败",logout:"退出",user_create:"添加账号",user_toggle:"账号启停",password_change:"修改密码",backup_create:"手工备份",backup_scheduled:"自动备份",backup_restore:"恢复备份",device_intake:"入库",device_quick_intake:"快速入库",device_update:"修改设备",device_status:"修改状态",reservation_create:"预订",reservation_cancel:"取消预订",repair_start:"送修",repair_complete:"维修完成",sale_return:"销售退货",device_sale:"出库",sale_update:"更正账目",label_print:"打印标签",label_print_failed:"打印失败",photo_add:"添加照片",after_sales_open:"登记售后",after_sales_resolve:"售后完成",handoff_create:"生成顾客交接卡",handoff_create_failed:"交接卡生成失败",handoff_reissue:"补发顾客交接卡",handoff_void:"作废顾客交接卡",inventory_csv_import:"批量导入"};
+const scopeNames = {today_intake:"今日入库",today_sold:"今日出库 / 已售",pending_completion:"待补全入库",pending_photos:"待拍外观",reserved:"预订中",pending_pickup:"已售待取",in_stock:"在库手机",unprinted:"待打印标签",aged:"超30天库存",aged60:"60–89天库存",aged90:"90天以上库存",in_repair:"送修中",sold:"已售设备",all:"全部库存"};
+const eventNames = {intake:"入库",quick_intake:"快速入库",csv_import:"批量导入",edit:"修改资料",photo_add:"添加照片",appearance_confirm:"完成外观留档",reserve:"预订",reservation_cancel:"取消预订",repair_start:"送修",repair_complete:"维修完成",sale:"出库",return:"销售退货",status_change:"修改状态",after_sales_open:"登记售后",after_sales_resolved:"售后完成"};
+const auditNames = {first_setup:"首次设置",login:"登录",login_failed:"登录失败",logout:"退出",user_create:"添加账号",user_toggle:"账号启停",password_change:"修改密码",backup_create:"手工备份",backup_scheduled:"自动备份",backup_restore:"恢复备份",device_intake:"入库",device_quick_intake:"快速入库",device_update:"修改设备",device_status:"修改状态",reservation_create:"预订",reservation_cancel:"取消预订",repair_start:"送修",repair_complete:"维修完成",sale_return:"销售退货",device_sale:"出库",sale_update:"更正账目",label_print:"打印标签",label_print_failed:"打印失败",photo_add:"添加照片",appearance_confirm:"完成外观留档",customer_create:"创建客户档案",customer_update:"更新客户档案",customer_merge:"合并客户档案",customer_contact_reveal:"查看客户电话",customer_anonymize:"客户匿名化",customer_interaction_create:"记录客户互动",customer_interaction_complete:"完成客户记录",customer_interaction_dismiss:"客户记录无需补充",after_sales_open:"登记售后",after_sales_resolve:"售后完成",handoff_create:"生成顾客交接卡",handoff_create_failed:"交接卡生成失败",handoff_reissue:"补发顾客交接卡",handoff_void:"作废顾客交接卡",inventory_csv_import:"批量导入"};
 const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
 }[char]));
@@ -60,6 +60,12 @@ async function boot() {
 async function loadApp() {
   show("app");
   user = user || await api.me();
+  for (const form of [$("#sale-form"),$("#scan-sale-form")]) {
+    if (form && !form.elements.customerQuickNote) {
+      const label=document.createElement("label");label.innerHTML='成交 / 客户速记（可选）<textarea name="customerQuickNote" maxlength="1000" placeholder="出库后会自动生成待补客户记录"></textarea>';
+      form.querySelector(".actions")?.before(label);
+    }
+  }
   $("#shop-name").textContent = user.shop_name;
   $("#role-text").textContent = `${user.display_name} · ${roles[user.role]}`;
   $("#market-button").hidden = user.role !== "owner";
@@ -122,6 +128,8 @@ async function refresh() {
   $("#reserved-count").textContent = dash.reservedCount;
   $("#pending-pickup-count").textContent = dash.pendingPickupCount;
   $("#pending-completion-count").textContent = dash.pendingCompletionCount;
+  $("#pending-photos-count").textContent = dash.pendingPhotosCount || 0;
+  $("#pending-customer-count").textContent = dash.pendingCustomerCount || 0;
   $("#unprinted-count").textContent = dash.unprintedCount;
   $("#inventory-cost").textContent = user.role === "owner" ? `库存成本 ${money(dash.inventoryCost)}` : "成本仅老板可见";
   $("#today-profit").textContent = user.role === "owner" ? `今日毛利 ${money(dash.todayProfit)}` : "今日毛利仅老板可见";
@@ -130,7 +138,7 @@ async function refresh() {
 }
 
 function render() {
-  const emptyMessage = $("#search").value.trim() ? "没有找到匹配设备" : ({today_intake:"今天还没有入库",today_sold:"今天还没有出库",pending_completion:"当前没有待补全设备",reserved:"当前没有预订设备",pending_pickup:"当前没有已售待取设备",in_stock:"当前没有在库设备",unprinted:"当前没有待打印标签",aged:"当前没有超30天库存"}[listScope] || "没有库存设备");
+  const emptyMessage = $("#search").value.trim() ? "没有找到匹配设备" : ({today_intake:"今天还没有入库",today_sold:"今天还没有出库",pending_completion:"当前没有待补全设备",pending_photos:"当前没有待拍外观设备",reserved:"当前没有预订设备",pending_pickup:"当前没有已售待取设备",in_stock:"当前没有在库设备",unprinted:"当前没有待打印标签",aged:"当前没有超30天库存"}[listScope] || "没有库存设备");
   $("#device-list").innerHTML = devices.length ? devices.map(device => `
     <article class="device" data-id="${device.id}">
       <div class="device-main">
@@ -1083,6 +1091,48 @@ $("#sale-form").addEventListener("submit", async event => {
     $("#sale-error").textContent = error.message;
   }
 });
+
+function customerTaskHtml(rows) {
+  return rows.length ? rows.map(item => `<button class="customer-row" data-customer-task="${esc(item.id)}"><span><b>${esc(item.display_name || item.model || "匿名客户")}</b><small>${esc(item.stock_code || item.interaction_type)} · ${new Date(item.occurred_at).toLocaleString("zh-CN")}</small><small>${esc(item.raw_note || "等待补充")}</small></span><i>补齐</i></button>`).join("") : `<p class="empty-inline">当前没有待补记录</p>`;
+}
+
+function customerListHtml(rows) {
+  return rows.length ? rows.map(item => `<button class="customer-row" data-customer-id="${esc(item.id)}"><span><b>${esc(item.display_name || "未填写称呼")}</b><small>${esc(item.phone || "无手机号")} · ${item.interaction_count}次互动</small><small>最后互动 ${item.last_interaction_at ? new Date(item.last_interaction_at).toLocaleDateString("zh-CN") : "-"}</small></span><i>详情</i></button>`).join("") : `<p class="empty-inline">没有找到客户</p>`;
+}
+
+function renderCustomerInsights(result) {
+  const items = (title,rows) => `<div><b>${title}</b><p>${rows.length ? rows.slice(0,5).map(row=>`${esc(row.label)} ${row.count}次`).join(" · ") : "暂无足够数据"}</p></div>`;
+  $("#customer-insight-content").innerHTML = `<p>已确认样本 ${result.sampleCount} 条${result.averageBudget ? ` · 平均预算 ${money(result.averageBudget)}` : ""}</p><div class="insight-grid">${items("来源",result.sources)}${items("意向型号",result.models)}${items("关注点",result.concerns)}${items("未成交原因",result.lostReasons)}</div>`;
+}
+
+async function loadCustomerCenter() {
+  const [dash,tasks,customers,insights] = await Promise.all([api.dashboard(),api.customerTasks("pending"),api.customers(),user.role==="owner"?api.customerInsights("internal"):Promise.resolve(null)]);
+  $("#customer-task-count").textContent=dash.pendingCustomerCount||0;$("#customer-followup-count").textContent=dash.followupDueCount||0;$("#customer-review-count").textContent=dash.customerReviewDueCount??"仅老板";
+  $("#customer-task-list").innerHTML=customerTaskHtml(tasks);$("#customer-list").innerHTML=customerListHtml(customers);if(insights)renderCustomerInsights(insights);else $("#customer-insight-content").textContent="匿名经营洞察仅老板可见";
+}
+
+function resetCustomerEditor() {
+  const form=$("#customer-editor-form");form.reset();form.dataset.existing="0";form.elements.rawNote.readOnly=false;$("#customer-dismiss").hidden=true;$("#customer-warning").hidden=true;$("#customer-error").textContent="";$("#customer-editor").hidden=false;$("#customer-detail").hidden=true;
+}
+
+async function editCustomerTask(id) {
+  const item=await api.customerInteraction(id),form=$("#customer-editor-form");resetCustomerEditor();form.dataset.existing="1";form.elements.id.value=item.id;form.elements.rawNote.value=item.raw_note||"";form.elements.rawNote.readOnly=true;form.elements.interactionType.value=item.interaction_type;form.elements.displayName.value=item.display_name||"";form.elements.phone.value=item.phone||"";form.elements.sourceChannel.value=item.source_channel||"";form.elements.budgetMax.value=item.budget_max??"";form.elements.preferredModel.value=item.preferred_model||"";form.elements.concerns.value=(item.concerns||[]).join("、");form.elements.lostReason.value=item.lost_reason||"";form.elements.outcome.value=item.outcome||"";form.elements.confirmedSummary.value=item.confirmed_summary||"";if(item.next_followup_at)form.elements.nextFollowupAt.value=new Date(item.next_followup_at).toISOString().slice(0,16);$("#customer-dismiss").hidden=false;$("#customer-editor").scrollIntoView({behavior:"smooth",block:"start"});
+}
+
+async function showCustomerDetail(id) {
+  const item=await api.customer(id),box=$("#customer-detail");box.hidden=false;$("#customer-editor").hidden=true;box.innerHTML=`<div class="customer-heading"><strong>${esc(item.display_name||"未填写称呼")}</strong><button data-customer-reveal="${esc(item.id)}">${item.phone ? esc(item.phone) : "无手机号"}</button></div><p>同意状态：${item.consent_status==="consented"?"已同意":"匿名"} · 两年复核：${item.review_due_at?new Date(item.review_due_at).toLocaleDateString("zh-CN"):"-"}</p><div>${item.interactions.map(row=>`<article class="customer-history"><b>${esc(row.interaction_type)} · ${esc(row.outcome||"未填结果")}</b><small>${new Date(row.occurred_at).toLocaleString("zh-CN")} ${row.stock_code?`· ${esc(row.stock_code)}`:""}</small><p>${esc(row.confirmed_summary||row.raw_note||"无摘要")}</p></article>`).join("")||"暂无历史互动"}</div>${user.role==="owner"&&item.status==="active"?`<button class="danger-button" data-customer-anonymize="${esc(item.id)}">确认匿名化</button>`:""}`;box.scrollIntoView({behavior:"smooth",block:"start"});
+}
+
+function fillCustomerSuggestions(s) { const f=$("#customer-editor-form");for(const [name,key] of Object.entries({budgetMax:"budgetMax",preferredModel:"preferredModel",sourceChannel:"sourceChannel",lostReason:"lostReason",nextFollowupAt:"nextFollowupAt"})){if(s[key]&&!f.elements[name].value)f.elements[name].value=name==="nextFollowupAt"?new Date(s[key]).toISOString().slice(0,16):s[key]}if(s.concerns?.length&&!f.elements.concerns.value)f.elements.concerns.value=s.concerns.join("、") }
+
+$("#customer-button").addEventListener("click",async()=>{$("#customer-dialog").showModal();await loadCustomerCenter()});
+$("#customer-pending-card").addEventListener("click",()=>$("#customer-button").click());
+$("#customer-new").addEventListener("click",()=>{resetCustomerEditor();$("#customer-editor").scrollIntoView({behavior:"smooth"})});
+$("#customer-search-form").addEventListener("submit",async event=>{event.preventDefault();$("#customer-list").innerHTML=customerListHtml(await api.customers(new FormData(event.currentTarget).get("q")))});
+$("#customer-parse").addEventListener("click",async()=>{const text=$("#customer-editor-form").elements.rawNote.value;if(!text)return toast("请先输入速记");try{const result=await api.parseCustomerNote(text);fillCustomerSuggestions(result.suggestions);$("#customer-warning").hidden=!result.warnings.length;$("#customer-warning").textContent=result.warnings.join("；");toast("已填入本地规则建议，请确认后保存")}catch(error){$("#customer-error").textContent=error.message}});
+$("#customer-editor-form").addEventListener("submit",async event=>{event.preventDefault();const form=event.currentTarget,data=Object.fromEntries(new FormData(form));data.consent=form.elements.consent.checked;try{if(form.dataset.existing==="1"){const id=data.id;delete data.id;delete data.rawNote;await api.completeCustomerInteraction(id,data)}else{delete data.id;data.complete=true;await api.createCustomerInteraction(data)}toast("客户记录已保存");$("#customer-editor").hidden=true;await loadCustomerCenter();await refresh()}catch(error){$("#customer-error").textContent=error.message}});
+$("#customer-dismiss").addEventListener("click",async()=>{const id=$("#customer-editor-form").elements.id.value;if(!id)return;await api.completeCustomerInteraction(id,{dismissed:true});$("#customer-editor").hidden=true;toast("已标记无需补充");await loadCustomerCenter();await refresh()});
+$("#customer-dialog").addEventListener("click",async event=>{const task=event.target.closest("[data-customer-task]");if(task)return editCustomerTask(task.dataset.customerTask);const detail=event.target.closest("[data-customer-id]");if(detail)return showCustomerDetail(detail.dataset.customerId);const reveal=event.target.closest("[data-customer-reveal]");if(reveal){const result=await api.revealCustomerContact(reveal.dataset.customerReveal);reveal.textContent=result.phone||"无手机号";toast("本次查看已写入操作日志");return}const anonymize=event.target.closest("[data-customer-anonymize]");if(anonymize&&confirm("匿名化会清除姓名、电话和可识别原始文字，保留交易账目和匿名统计。确认继续？")){await api.anonymizeCustomer(anonymize.dataset.customerAnonymize);toast("客户档案已匿名化");await loadCustomerCenter();$("#customer-detail").hidden=true}});
 
 boot().catch(error => {
   show("login");

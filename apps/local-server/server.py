@@ -79,7 +79,7 @@ except ImportError:
     android_usb_status = read_android_usb = None
 
 COOKIE_NAME = "zhanggui_session"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 SESSION_HOURS = 12
 PASSWORD_MIN_LENGTH = 10
 PBKDF2_ROUNDS = 600_000
@@ -100,6 +100,29 @@ MARKET_FEED_PAGES = {
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def normalize_phone(value: object) -> str:
+    """Normalize a voluntarily supplied contact number without putting it in logs."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    if digits.startswith("86") and len(digits) == 13:
+        digits = digits[2:]
+    if digits and not 6 <= len(digits) <= 20:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "手机号格式不正确")
+    return digits
+
+
+def mask_phone(value: object) -> str:
+    phone = str(value or "")
+    if len(phone) <= 4:
+        return "••••" if phone else ""
+    if len(phone) <= 7:
+        return phone[:2] + "•••" + phone[-2:]
+    return phone[:3] + "••••" + phone[-4:]
+
+
+def customer_review_due(stamp: str) -> str:
+    return (datetime.fromisoformat(stamp) + timedelta(days=730)).isoformat(timespec="seconds")
 
 
 def build_logger() -> logging.Logger:
@@ -254,6 +277,45 @@ def migrate_db() -> None:
                 db.execute("alter table devices add column intake_state text not null default 'complete' check (intake_state in ('pending','complete'))")
             db.execute("create index if not exists devices_shop_intake_state_idx on devices(shop_id,intake_state) where deleted_at is null")
             db.execute("insert into schema_migrations(version,applied_at) values(8,?)", (now_iso(),))
+        if 9 not in applied:
+            device_columns = {row[1] for row in db.execute("pragma table_info(devices)")}
+            if "appearance_status" not in device_columns:
+                db.execute("alter table devices add column appearance_status text not null default 'pending' check (appearance_status in ('pending','complete_no_defect','complete_with_defect'))")
+                # Existing stock predates the appearance workflow; do not create hundreds of false reminders.
+                db.execute("update devices set appearance_status='complete_no_defect'")
+            db.executescript("""
+                create table if not exists customers (
+                  id text primary key, shop_id text not null references shops(id),
+                  display_name text not null default '', phone text not null default '',
+                  phone_normalized text not null default '', phone_tail text not null default '',
+                  consent_status text not null default 'anonymous' check(consent_status in ('anonymous','consented')),
+                  consent_at text, status text not null default 'active' check(status in ('active','anonymized')),
+                  last_interaction_at text, review_due_at text,
+                  created_by text not null references users(id), updated_by text not null references users(id),
+                  created_at text not null, updated_at text not null
+                );
+                create unique index if not exists customers_shop_phone_unique on customers(shop_id,phone_normalized) where phone_normalized<>'' and status='active';
+                create index if not exists customers_shop_last_idx on customers(shop_id,status,last_interaction_at desc);
+                create index if not exists customers_shop_review_idx on customers(shop_id,status,review_due_at);
+                create table if not exists customer_interactions (
+                  id text primary key, shop_id text not null references shops(id),
+                  customer_id text references customers(id), sale_id text references sales(id), device_id text references devices(id),
+                  interaction_type text not null default 'inquiry' check(interaction_type in ('purchase','sell_to_store','inquiry','trade_in','repair','other')),
+                  completion_status text not null default 'pending' check(completion_status in ('pending','completed','dismissed')),
+                  source_channel text not null default '', budget_min real check(budget_min is null or budget_min>=0),
+                  budget_max real check(budget_max is null or budget_max>=0), preferred_brand text not null default '',
+                  preferred_model text not null default '', preferred_storage text not null default '', concerns text not null default '[]',
+                  outcome text not null default '', lost_reason text not null default '', next_followup_at text,
+                  raw_note text not null default '', confirmed_summary text not null default '',
+                  created_by text not null references users(id), updated_by text not null references users(id),
+                  occurred_at text not null, created_at text not null, updated_at text not null
+                );
+                create unique index if not exists customer_interactions_sale_unique on customer_interactions(sale_id) where sale_id is not null;
+                create index if not exists customer_interactions_shop_task_idx on customer_interactions(shop_id,completion_status,created_at desc);
+                create index if not exists customer_interactions_customer_idx on customer_interactions(customer_id,occurred_at desc);
+                create index if not exists customer_interactions_followup_idx on customer_interactions(shop_id,next_followup_at) where completion_status='completed';
+            """)
+            db.execute("insert into schema_migrations(version,applied_at) values(9,?)", (now_iso(),))
 
 
 def database_check() -> str:
@@ -804,6 +866,16 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.send_json(self.list_users(self.current_user()))
             if path == "/api/dashboard":
                 return self.send_json(self.dashboard(self.current_user()))
+            if path == "/api/customer-tasks":
+                return self.send_json(self.list_customer_tasks(self.current_user()))
+            if path == "/api/customers":
+                return self.send_json(self.list_customers(self.current_user()))
+            if path.startswith("/api/customers/") and path.count("/") == 3:
+                return self.send_json(self.customer_detail(self.current_user(), path.split("/")[3]))
+            if path.startswith("/api/customer-interactions/") and path.count("/") == 3:
+                return self.send_json(self.customer_interaction_detail(self.current_user(), path.split("/")[3]))
+            if path == "/api/customer-insights":
+                return self.send_json(self.customer_insights(self.current_user()))
             if path == "/api/devices":
                 return self.send_json(self.list_devices(self.current_user()))
             if path.startswith("/api/devices/") and path.count("/") == 3:
@@ -876,6 +948,18 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.recognize_qr(self.current_user(), self.read_json(15_000_000))
             if path == "/api/smart/parse-intake":
                 return self.send_json(self.parse_intake_text(self.current_user(), self.read_json()))
+            if path == "/api/customer-notes/parse":
+                return self.send_json(self.parse_customer_note(self.current_user(), self.read_json()))
+            if path == "/api/customer-interactions":
+                return self.create_customer_interaction(self.current_user(), self.read_json())
+            if path.startswith("/api/customer-interactions/") and path.endswith("/complete"):
+                return self.complete_customer_interaction(self.current_user(), path.split("/")[3], self.read_json())
+            if path.startswith("/api/customers/") and path.endswith("/update"):
+                return self.update_customer(self.current_user(), path.split("/")[3], self.read_json())
+            if path.startswith("/api/customers/") and path.endswith("/reveal-contact"):
+                return self.reveal_customer_contact(self.current_user(), path.split("/")[3])
+            if path.startswith("/api/customers/") and path.endswith("/anonymize"):
+                return self.anonymize_customer(self.current_user(), path.split("/")[3])
             if path == "/api/market/quotes":
                 return self.create_market_quote(self.current_user(), self.read_json())
             if path == "/api/market/sheet/recognize":
@@ -912,6 +996,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 return self.resolve_after_sales(self.current_user(), path.split("/")[3], self.read_json())
             if path.startswith("/api/devices/") and path.endswith("/photos"):
                 return self.add_device_photo(self.current_user(), path.split("/")[3], self.read_json(15_000_000))
+            if path.startswith("/api/devices/") and path.endswith("/appearance/confirm"):
+                return self.confirm_device_appearance(self.current_user(), path.split("/")[3], self.read_json())
             if path == "/api/stocktakes/start": return self.start_stocktake(self.current_user(), self.read_json())
             if path.startswith("/api/stocktakes/") and path.endswith("/scan"):
                 return self.scan_stocktake(self.current_user(), path.split("/")[3], self.read_json())
@@ -1097,11 +1183,15 @@ class StoreHandler(SimpleHTTPRequestHandler):
             pending_pickup = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status='sold_pending_pickup'", (user["shop_id"],)).fetchone()[0]
             unprinted = db.execute("select count(*) from devices d where d.shop_id=? and d.deleted_at is null and d.status in ('in_stock','reserved','sold_pending_pickup') and not exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed')", (user["shop_id"],)).fetchone()[0]
             pending_completion = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and intake_state='pending'", (user["shop_id"],)).fetchone()[0]
+            pending_photos = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and appearance_status='pending' and status not in ('sold','scrapped')", (user["shop_id"],)).fetchone()[0]
+            pending_customers = db.execute("select count(*) from customer_interactions where shop_id=? and completion_status='pending'", (user["shop_id"],)).fetchone()[0]
+            followup_due = db.execute("select count(*) from customer_interactions where shop_id=? and completion_status='completed' and next_followup_at is not null and datetime(next_followup_at)<=datetime('now')", (user["shop_id"],)).fetchone()[0]
             aged = db.execute("select count(*) from devices where shop_id=? and deleted_at is null and status in ('in_stock','reserved') and julianday('now')-julianday(created_at)>30", (user["shop_id"],)).fetchone()[0]
             sold = db.execute("select count(*),coalesce(sum(sale_price),0) from sales where shop_id=? and date(sold_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()
             returned = db.execute("select count(*),coalesce(sum(refund_amount),0) from returns where shop_id=? and date(created_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()
-            result = {"activeCount": active, "todayIntake": today_intake, "reservedCount": reserved, "pendingPickupCount": pending_pickup, "pendingCompletionCount": pending_completion, "unprintedCount": unprinted, "agedCount": aged, "todaySold": max(0,sold[0]-returned[0]), "todayRevenue": sold[1]-returned[1], "role": user["role"]}
+            result = {"activeCount": active, "todayIntake": today_intake, "reservedCount": reserved, "pendingPickupCount": pending_pickup, "pendingCompletionCount": pending_completion, "pendingPhotosCount": pending_photos, "pendingCustomerCount": pending_customers, "followupDueCount": followup_due, "unprintedCount": unprinted, "agedCount": aged, "todaySold": max(0,sold[0]-returned[0]), "todayRevenue": sold[1]-returned[1], "role": user["role"]}
             if user["role"] == "owner":
+                result["customerReviewDueCount"] = db.execute("select count(*) from customers where shop_id=? and status='active' and review_due_at is not null and datetime(review_due_at)<=datetime('now')", (user["shop_id"],)).fetchone()[0]
                 result["inventoryCost"] = db.execute("select coalesce(sum(f.purchase_cost),0) from devices d join device_financials f on f.device_id=d.id where d.shop_id=? and d.deleted_at is null and d.status in ('in_stock','reserved','sold_pending_pickup')", (user["shop_id"],)).fetchone()[0]
                 gross = db.execute("select coalesce(sum(s.sale_price-s.purchase_cost_snapshot),0) from sales s where s.shop_id=? and date(s.sold_at,'localtime')=date('now','localtime')", (user["shop_id"],)).fetchone()[0]
                 return_impact = db.execute("""select coalesce(sum(case when r.disposition='restock' then r.refund_amount-s.purchase_cost_snapshot else r.refund_amount end),0) from returns r left join sales s on s.id=r.sale_id where r.shop_id=? and date(r.created_at,'localtime')=date('now','localtime')""",(user["shop_id"],)).fetchone()[0]
@@ -1208,6 +1298,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         elif scope == "pending_pickup": sql += " and d.status='sold_pending_pickup'"
         elif scope == "in_stock": sql += " and d.status='in_stock'"
         elif scope == "pending_completion": sql += " and d.intake_state='pending'"
+        elif scope == "pending_photos": sql += " and d.appearance_status='pending' and d.status not in ('sold','scrapped')"
         elif scope == "unprinted": sql += " and d.status in ('in_stock','reserved','sold_pending_pickup') and not exists(select 1 from print_jobs p where p.device_id=d.id and p.status='printed')"
         elif scope == "aged": sql += " and d.status in ('in_stock','reserved') and julianday('now')-julianday(d.created_at)>30"
         elif scope == "aged60": sql += " and d.status in ('in_stock','reserved') and julianday('now')-julianday(d.created_at)>=60 and julianday('now')-julianday(d.created_at)<90"
@@ -1259,12 +1350,16 @@ class StoreHandler(SimpleHTTPRequestHandler):
         return result
 
     def update_device(self, user: dict, device_id: str, data: dict) -> None:
-        allowed = {"model":"model","storage":"storage","color":"color","systemVersion":"system_version","batteryHealth":"battery_health","chargeCycles":"charge_cycles","conditionGrade":"condition_grade","listPrice":"list_price","area":"area","notes":"notes"}
+        allowed = {"brand":"brand","model":"model","storage":"storage","imei":"imei","imei2":"imei2","serialNumber":"serial_number","color":"color","systemVersion":"system_version","batteryHealth":"battery_health","chargeCycles":"charge_cycles","conditionGrade":"condition_grade","listPrice":"list_price","area":"area","notes":"notes"}
         values = {column: data[key] for key, column in allowed.items() if key in data}
         mark_complete = str(data.get("markComplete", "")).lower() in ("1", "true", "on", "yes")
         has_purchase_cost = user["role"] == "owner" and "purchaseCost" in data
         if not values and not mark_complete and not has_purchase_cost: raise ApiError(HTTPStatus.BAD_REQUEST, "没有需要修改的内容")
         if "list_price" in values and float(values["list_price"]) < 0: raise ApiError(HTTPStatus.BAD_REQUEST, "售价不能小于0")
+        for column in ("imei", "imei2"):
+            if column in values:
+                values[column] = re.sub(r"\D", "", str(values[column])) or None
+                if values[column] and len(values[column]) != 15: raise ApiError(HTTPStatus.BAD_REQUEST, f"{column.upper()}必须是15位数字")
         stamp = now_iso()
         with WRITE_LOCK, connect() as db:
             before = db.execute("select * from devices where id=? and shop_id=? and deleted_at is null", (device_id,user["shop_id"])).fetchone()
@@ -1552,14 +1647,17 @@ class StoreHandler(SimpleHTTPRequestHandler):
             if device["intake_state"] != "complete": raise ApiError(HTTPStatus.CONFLICT, "这台手机仍在待补全，完成验机和标价后才能出库")
             if device["status"] not in ("in_stock","reserved","sold_pending_pickup"): raise ApiError(HTTPStatus.CONFLICT, "设备当前状态不能出库")
             sale_id = str(uuid.uuid4())
+            customer_task_id = str(uuid.uuid4())
             truthy = lambda value: 1 if str(value).lower() in ("1", "true", "on", "yes") else 0
             db.execute("""insert into sales(id,shop_id,device_id,sale_price,payment_method,customer_note,sold_by,sold_at,model_snapshot,storage_snapshot,imei_snapshot,purchase_cost_snapshot,gift_case,gift_screen_protector,gift_charging_head,gift_charger,warranty_days,warranty_expires_at)
                 values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (sale_id,user["shop_id"],device_id,price,str(data.get("paymentMethod", "")),str(data.get("customerNote", "")),user["id"],stamp,device["model"],device["storage"],device["imei"] or device["serial_number"] or "",device["purchase_cost"],truthy(data.get("giftCase")),truthy(data.get("giftScreenProtector")),truthy(data.get("giftChargingHead")),truthy(data.get("giftCharger")),warranty_days,warranty_expires))
             db.execute("update devices set status='sold',updated_by=?,updated_at=? where id=?", (user["id"],stamp,device_id))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)", (user["shop_id"],device_id,"sale",device["status"],"sold",str(data.get("customerNote", "")),user["id"],stamp))
+            db.execute("""insert into customer_interactions(id,shop_id,sale_id,device_id,interaction_type,completion_status,outcome,raw_note,created_by,updated_by,occurred_at,created_at,updated_at)
+                values(?,?,?,?,?,'pending','purchased',?,?,?,?,?,?)""", (customer_task_id,user["shop_id"],sale_id,device_id,"purchase",str(data.get("customerQuickNote") or "").strip(),user["id"],user["id"],stamp,stamp,stamp))
             audit_insert(db, shop_id=user["shop_id"], action="device_sale", summary=f"出库：{device['stock_code']}，成交价{price:g}元", actor=user, entity_type="sale", entity_id=sale_id, details={"stockCode": device["stock_code"], "warrantyDays": warranty_days}, client_ip=self.client_ip)
             db.commit()
-        response = {"ok": True, "saleId": sale_id}
+        response = {"ok": True, "saleId": sale_id, "customerTaskId": customer_task_id}
         try:
             response["handoff"] = self.create_handoff_for_sale(user, sale_id, data)
         except Exception as error:
@@ -1910,6 +2008,9 @@ class StoreHandler(SimpleHTTPRequestHandler):
         self.send_response(HTTPStatus.OK); self.send_header("Content-Type",content_type); self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","private,max-age=3600"); self.end_headers(); self.wfile.write(body)
 
     def add_device_photo(self,user:dict,device_id:str,data:dict)->None:
+        photo_type = str(data.get("photoType") or "other").strip().lower()
+        allowed_types = {"front":"正面","back":"背面","frame":"边框","defect":"瑕疵","other":"其他","inspection_screenshot":"验机截图"}
+        if photo_type not in allowed_types: raise ApiError(HTTPStatus.BAD_REQUEST,"照片分类不正确")
         encoded=str(data.get("image","")); match=re.match(r"^data:image/(png|jpeg|jpg|webp);base64,(.+)$",encoded,re.I|re.S)
         if not match: raise ApiError(HTTPStatus.BAD_REQUEST,"请选择照片")
         try: body=base64.b64decode(match.group(2),validate=True)
@@ -1920,12 +2021,251 @@ class StoreHandler(SimpleHTTPRequestHandler):
         with connect() as db:
             if not db.execute("select 1 from devices where id=? and shop_id=?",(device_id,user["shop_id"])).fetchone(): raise ApiError(HTTPStatus.NOT_FOUND,"没有找到设备")
         suffix=".jpg" if match.group(1).lower() in ("jpeg","jpg") else "."+match.group(1).lower(); photo_id=str(uuid.uuid4()); directory=DB_PATH.parent/"device-photos"; directory.mkdir(parents=True,exist_ok=True); path=directory/f"{photo_id}{suffix}"; path.write_bytes(body); stamp=now_iso()
-        description=str(data.get("description","")).strip() or "设备实拍图"
+        description=str(data.get("description","")).strip() or allowed_types[photo_type]
         with connect() as db:
-            db.execute("insert into device_photos values(?,?,?,?,?,?,?,?)",(photo_id,user["shop_id"],device_id,"defect",str(path.relative_to(DB_PATH.parent)),description,user["id"],stamp))
+            db.execute("insert into device_photos values(?,?,?,?,?,?,?,?)",(photo_id,user["shop_id"],device_id,photo_type,str(path.relative_to(DB_PATH.parent)),description,user["id"],stamp))
             db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) select shop_id,id,'photo_add',status,status,?,?,? from devices where id=?",(description,user["id"],stamp,device_id))
-            audit_insert(db, shop_id=user["shop_id"], action="photo_add", summary="添加设备照片", actor=user, entity_type="device", entity_id=device_id, client_ip=self.client_ip)
-        self.send_json({"ok":True,"id":photo_id,"description":description},HTTPStatus.CREATED)
+            audit_insert(db, shop_id=user["shop_id"], action="photo_add", summary=f"添加设备{allowed_types[photo_type]}照片", actor=user, entity_type="device", entity_id=device_id, details={"photoType":photo_type}, client_ip=self.client_ip)
+        self.send_json({"ok":True,"id":photo_id,"photoType":photo_type,"description":description},HTTPStatus.CREATED)
+
+    def confirm_device_appearance(self, user: dict, device_id: str, data: dict) -> None:
+        result = str(data.get("result") or "").strip()
+        if result not in ("no_obvious_defect", "defect_documented"):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "请选择无明显瑕疵或已拍瑕疵图")
+        with WRITE_LOCK, connect() as db:
+            device = db.execute("select id,status from devices where id=? and shop_id=? and deleted_at is null", (device_id,user["shop_id"])).fetchone()
+            if not device: raise ApiError(HTTPStatus.NOT_FOUND,"没有找到设备")
+            types = {row[0] for row in db.execute("select photo_type from device_photos where device_id=?", (device_id,))}
+            missing = [name for key,name in (("front","正面"),("back","背面")) if key not in types]
+            if result == "defect_documented" and "defect" not in types: missing.append("瑕疵")
+            if missing: raise ApiError(HTTPStatus.CONFLICT,"还需要拍摄："+"、".join(missing))
+            status = "complete_no_defect" if result == "no_obvious_defect" else "complete_with_defect"
+            stamp = now_iso()
+            db.execute("update devices set appearance_status=?,updated_by=?,updated_at=? where id=?", (status,user["id"],stamp,device_id))
+            db.execute("insert into inventory_events(shop_id,device_id,event_type,from_status,to_status,note,actor_id,created_at) values(?,?,?,?,?,?,?,?)", (user["shop_id"],device_id,"appearance_confirm",device["status"],device["status"],status,user["id"],stamp))
+            audit_insert(db, shop_id=user["shop_id"], action="appearance_confirm", summary="完成设备外观留档", actor=user, entity_type="device", entity_id=device_id, details={"result":result}, client_ip=self.client_ip)
+        self.send_json({"ok":True,"appearanceStatus":status})
+
+    def _customer_from_input(self, db: sqlite3.Connection, user: dict, data: dict, stamp: str) -> str | None:
+        name = str(data.get("displayName") or "").strip()[:80]
+        phone = normalize_phone(data.get("phone"))
+        if not name and not phone:
+            return None
+        consent = str(data.get("consent") or "").lower() in ("1","true","yes","on","consented")
+        if not consent:
+            raise ApiError(HTTPStatus.BAD_REQUEST,"填写称呼或手机号前，必须确认已告知并获得客户同意；客户不愿提供时请保存匿名记录")
+        existing = db.execute("select id from customers where shop_id=? and phone_normalized=? and status='active'", (user["shop_id"],phone)).fetchone() if phone else None
+        if existing:
+            customer_id = existing["id"]
+            db.execute("""update customers set display_name=case when ?<>'' then ? else display_name end,
+                consent_status='consented',consent_at=coalesce(consent_at,?),last_interaction_at=?,review_due_at=?,updated_by=?,updated_at=? where id=?""",
+                (name,name,stamp,stamp,customer_review_due(stamp),user["id"],stamp,customer_id))
+            return customer_id
+        customer_id = str(uuid.uuid4())
+        db.execute("""insert into customers(id,shop_id,display_name,phone,phone_normalized,phone_tail,consent_status,consent_at,status,last_interaction_at,review_due_at,created_by,updated_by,created_at,updated_at)
+            values(?,?,?,?,?,?,'consented',?,'active',?,?,?,?,?,?)""",
+            (customer_id,user["shop_id"],name,phone,phone,phone[-4:] if phone else "",stamp,stamp,customer_review_due(stamp),user["id"],user["id"],stamp,stamp))
+        audit_insert(db,shop_id=user["shop_id"],action="customer_create",summary="创建客户档案",actor=user,entity_type="customer",entity_id=customer_id,client_ip=self.client_ip)
+        return customer_id
+
+    def _interaction_values(self, data: dict) -> tuple:
+        def amount(key: str):
+            value = data.get(key)
+            if value in (None,""): return None
+            try: result = float(value)
+            except (TypeError,ValueError): raise ApiError(HTTPStatus.BAD_REQUEST,"预算格式不正确")
+            if result < 0: raise ApiError(HTTPStatus.BAD_REQUEST,"预算不能小于0")
+            return result
+        concerns = data.get("concerns") or []
+        if isinstance(concerns,str): concerns = [item.strip() for item in re.split(r"[,，、]",concerns) if item.strip()]
+        if not isinstance(concerns,list): raise ApiError(HTTPStatus.BAD_REQUEST,"关注点格式不正确")
+        return (
+            str(data.get("sourceChannel") or "").strip()[:40], amount("budgetMin"), amount("budgetMax"),
+            str(data.get("preferredBrand") or "").strip()[:40], str(data.get("preferredModel") or "").strip()[:100],
+            str(data.get("preferredStorage") or "").strip()[:30], json.dumps([str(item)[:30] for item in concerns[:12]],ensure_ascii=False),
+            str(data.get("outcome") or "").strip()[:50], str(data.get("lostReason") or "").strip()[:80],
+            str(data.get("nextFollowupAt") or "").strip() or None, str(data.get("confirmedSummary") or "").strip()[:1000],
+        )
+
+    def create_customer_interaction(self, user: dict, data: dict) -> None:
+        interaction_type = str(data.get("interactionType") or "inquiry")
+        if interaction_type not in {"purchase","sell_to_store","inquiry","trade_in","repair","other"}:
+            raise ApiError(HTTPStatus.BAD_REQUEST,"客户场景不正确")
+        raw_note = str(data.get("rawNote") or "").strip()[:4000]
+        completion = "completed" if str(data.get("complete") or "").lower() in ("1","true","yes","on") else "pending"
+        stamp, interaction_id = now_iso(), str(uuid.uuid4())
+        with WRITE_LOCK, connect() as db:
+            db.execute("begin immediate")
+            customer_id = self._customer_from_input(db,user,data,stamp)
+            values = self._interaction_values(data)
+            db.execute("""insert into customer_interactions(id,shop_id,customer_id,device_id,interaction_type,completion_status,source_channel,budget_min,budget_max,preferred_brand,preferred_model,preferred_storage,concerns,outcome,lost_reason,next_followup_at,raw_note,confirmed_summary,created_by,updated_by,occurred_at,created_at,updated_at)
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (interaction_id,user["shop_id"],customer_id,data.get("deviceId") or None,interaction_type,completion,*values[:10],raw_note,values[10],user["id"],user["id"],stamp,stamp,stamp))
+            audit_insert(db,shop_id=user["shop_id"],action="customer_interaction_create",summary="记录客户互动",actor=user,entity_type="customer_interaction",entity_id=interaction_id,details={"type":interaction_type,"identified":bool(customer_id)},client_ip=self.client_ip)
+            db.commit()
+        self.send_json({"ok":True,"id":interaction_id,"customerId":customer_id,"completionStatus":completion},HTTPStatus.CREATED)
+
+    def complete_customer_interaction(self, user: dict, interaction_id: str, data: dict) -> None:
+        dismissed = str(data.get("dismissed") or "").lower() in ("1","true","yes","on")
+        stamp = now_iso()
+        with WRITE_LOCK, connect() as db:
+            db.execute("begin immediate")
+            row = db.execute("select * from customer_interactions where id=? and shop_id=?",(interaction_id,user["shop_id"])).fetchone()
+            if not row: raise ApiError(HTTPStatus.NOT_FOUND,"没有找到客户记录")
+            if dismissed:
+                db.execute("update customer_interactions set completion_status='dismissed',updated_by=?,updated_at=? where id=?",(user["id"],stamp,interaction_id))
+                action = "customer_interaction_dismiss"
+            else:
+                customer_id = row["customer_id"] or self._customer_from_input(db,user,data,stamp)
+                values = self._interaction_values(data)
+                db.execute("""update customer_interactions set customer_id=?,completion_status='completed',source_channel=?,budget_min=?,budget_max=?,preferred_brand=?,preferred_model=?,preferred_storage=?,concerns=?,outcome=?,lost_reason=?,next_followup_at=?,confirmed_summary=?,updated_by=?,updated_at=? where id=?""",
+                    (customer_id,*values,user["id"],stamp,interaction_id))
+                if customer_id:
+                    db.execute("update customers set last_interaction_at=?,review_due_at=?,updated_by=?,updated_at=? where id=?",(stamp,customer_review_due(stamp),user["id"],stamp,customer_id))
+                action = "customer_interaction_complete"
+            audit_insert(db,shop_id=user["shop_id"],action=action,summary="完成客户记录" if not dismissed else "客户记录无需补充",actor=user,entity_type="customer_interaction",entity_id=interaction_id,client_ip=self.client_ip)
+            db.commit()
+        self.send_json({"ok":True,"completionStatus":"dismissed" if dismissed else "completed"})
+
+    def list_customer_tasks(self, user: dict) -> list[dict]:
+        status = parse_qs(urlparse(self.path).query).get("status",["pending"])[0]
+        if status not in ("pending","completed","dismissed","followup"): status = "pending"
+        where = "i.completion_status=?"; args: list = [user["shop_id"],status]
+        if status == "followup": where = "i.completion_status='completed' and i.next_followup_at is not null and datetime(i.next_followup_at)<=datetime('now')"; args=[user["shop_id"]]
+        with connect() as db:
+            rows = [dict(row) for row in db.execute(f"""select i.id,i.customer_id,i.sale_id,i.device_id,i.interaction_type,i.completion_status,i.source_channel,i.outcome,i.next_followup_at,i.raw_note,i.occurred_at,
+                coalesce(c.display_name,'') display_name,coalesce(c.phone,'') phone,d.stock_code,d.model,d.storage
+                from customer_interactions i left join customers c on c.id=i.customer_id left join devices d on d.id=i.device_id
+                where i.shop_id=? and {where} order by coalesce(i.next_followup_at,i.created_at),i.created_at desc limit 300""",args)]
+        for row in rows: row["phone"] = mask_phone(row.get("phone"))
+        return rows
+
+    def customer_interaction_detail(self, user: dict, interaction_id: str) -> dict:
+        with connect() as db:
+            row = db.execute("""select i.*,coalesce(c.display_name,'') display_name,coalesce(c.phone,'') phone,d.stock_code,d.model,d.storage
+                from customer_interactions i left join customers c on c.id=i.customer_id left join devices d on d.id=i.device_id
+                where i.id=? and i.shop_id=?""",(interaction_id,user["shop_id"])).fetchone()
+        if not row: raise ApiError(HTTPStatus.NOT_FOUND,"没有找到客户记录")
+        result = dict(row); result["phone"] = mask_phone(result.get("phone"))
+        try: result["concerns"] = json.loads(result.get("concerns") or "[]")
+        except json.JSONDecodeError: result["concerns"] = []
+        return result
+
+    def list_customers(self, user: dict) -> list[dict]:
+        query = parse_qs(urlparse(self.path).query); text=query.get("q",[""])[0].strip(); review=query.get("reviewDue",[""])[0] == "1"
+        sql="""select c.id,c.display_name,c.phone,c.consent_status,c.status,c.last_interaction_at,c.review_due_at,count(i.id) interaction_count
+            from customers c left join customer_interactions i on i.customer_id=c.id where c.shop_id=?"""; args:list=[user["shop_id"]]
+        if text:
+            digits=re.sub(r"\D","",text); sql+=" and (c.display_name like ? or c.phone_tail like ? or c.phone_normalized=?)"; args.extend([f"%{text}%",f"%{digits[-4:]}%",digits])
+        if review: sql+=" and c.status='active' and c.review_due_at is not null and datetime(c.review_due_at)<=datetime('now')"
+        sql+=" group by c.id order by coalesce(c.last_interaction_at,c.created_at) desc limit 300"
+        with connect() as db: rows=[dict(row) for row in db.execute(sql,args)]
+        for row in rows: row["phone"] = mask_phone(row.get("phone"))
+        return rows
+
+    def customer_detail(self, user: dict, customer_id: str) -> dict:
+        with connect() as db:
+            row=db.execute("select * from customers where id=? and shop_id=?",(customer_id,user["shop_id"])).fetchone()
+            if not row: raise ApiError(HTTPStatus.NOT_FOUND,"没有找到客户档案")
+            interactions=[dict(item) for item in db.execute("""select i.*,d.stock_code,d.model,d.storage from customer_interactions i left join devices d on d.id=i.device_id where i.customer_id=? order by i.occurred_at desc""",(customer_id,))]
+        result=dict(row); result["phone"]=result["phone"] if user["role"]=="owner" else mask_phone(result["phone"]); result["interactions"]=interactions
+        for item in interactions:
+            try:item["concerns"]=json.loads(item.get("concerns") or "[]")
+            except json.JSONDecodeError:item["concerns"]=[]
+        return result
+
+    def reveal_customer_contact(self, user: dict, customer_id: str) -> None:
+        with WRITE_LOCK, connect() as db:
+            row=db.execute("select phone from customers where id=? and shop_id=? and status='active'",(customer_id,user["shop_id"])).fetchone()
+            if not row: raise ApiError(HTTPStatus.NOT_FOUND,"没有找到客户档案")
+            audit_insert(db,shop_id=user["shop_id"],action="customer_contact_reveal",summary="查看单个客户联系方式",actor=user,entity_type="customer",entity_id=customer_id,client_ip=self.client_ip)
+        self.send_json({"phone":row["phone"]})
+
+    def update_customer(self, user: dict, customer_id: str, data: dict) -> None:
+        name=str(data.get("displayName") or "").strip()[:80]; phone=normalize_phone(data.get("phone")); consent=str(data.get("consent") or "").lower() in ("1","true","yes","on","consented")
+        if (name or phone) and not consent: raise ApiError(HTTPStatus.BAD_REQUEST,"保存可识别资料前必须确认客户同意")
+        stamp=now_iso()
+        merged_into=None
+        with WRITE_LOCK, connect() as db:
+            if not db.execute("select 1 from customers where id=? and shop_id=? and status='active'",(customer_id,user["shop_id"])).fetchone(): raise ApiError(HTTPStatus.NOT_FOUND,"没有找到客户档案")
+            duplicate=db.execute("select id from customers where shop_id=? and phone_normalized=? and status='active' and id<>?",(user["shop_id"],phone,customer_id)).fetchone() if phone else None
+            if duplicate:
+                target_id=duplicate["id"]
+                db.execute("update customer_interactions set customer_id=?,updated_by=?,updated_at=? where customer_id=?",(target_id,user["id"],stamp,customer_id))
+                db.execute("""update customers set display_name=case when ?<>'' then ? else display_name end,
+                    last_interaction_at=(select max(occurred_at) from customer_interactions where customer_id=?),review_due_at=?,updated_by=?,updated_at=? where id=?""",
+                    (name,name,target_id,customer_review_due(stamp),user["id"],stamp,target_id))
+                db.execute("update customers set display_name='',phone='',phone_normalized='',phone_tail='',consent_status='anonymous',consent_at=null,status='anonymized',updated_by=?,updated_at=? where id=?",(user["id"],stamp,customer_id))
+                audit_insert(db,shop_id=user["shop_id"],action="customer_merge",summary="合并重复客户档案",actor=user,entity_type="customer",entity_id=customer_id,details={"mergedInto":target_id},client_ip=self.client_ip)
+                merged_into=target_id
+            else:
+                db.execute("update customers set display_name=?,phone=?,phone_normalized=?,phone_tail=?,consent_status=?,consent_at=coalesce(consent_at,?),updated_by=?,updated_at=? where id=?",(name,phone,phone,phone[-4:] if phone else "","consented" if consent else "anonymous",stamp if consent else None,user["id"],stamp,customer_id))
+                audit_insert(db,shop_id=user["shop_id"],action="customer_update",summary="更新客户档案",actor=user,entity_type="customer",entity_id=customer_id,client_ip=self.client_ip)
+        self.send_json({"ok":True,**({"mergedInto":merged_into} if merged_into else {})})
+
+    def anonymize_customer(self, user: dict, customer_id: str) -> None:
+        if user["role"]!="owner": raise ApiError(HTTPStatus.FORBIDDEN,"只有老板可以匿名化客户档案")
+        stamp=now_iso()
+        with WRITE_LOCK, connect() as db:
+            if not db.execute("select 1 from customers where id=? and shop_id=?",(customer_id,user["shop_id"])).fetchone(): raise ApiError(HTTPStatus.NOT_FOUND,"没有找到客户档案")
+            db.execute("update customers set display_name='',phone='',phone_normalized='',phone_tail='',consent_status='anonymous',consent_at=null,status='anonymized',updated_by=?,updated_at=? where id=?",(user["id"],stamp,customer_id))
+            db.execute("update customer_interactions set raw_note='',confirmed_summary='',updated_by=?,updated_at=? where customer_id=?",(user["id"],stamp,customer_id))
+            audit_insert(db,shop_id=user["shop_id"],action="customer_anonymize",summary="匿名化客户档案",actor=user,entity_type="customer",entity_id=customer_id,client_ip=self.client_ip)
+        self.send_json({"ok":True,"status":"anonymized"})
+
+    def parse_customer_note(self, user: dict, data: dict) -> dict:
+        text=str(data.get("text") or "").strip()[:4000]
+        suggestions={"budgetMin":None,"budgetMax":None,"preferredBrand":"","preferredModel":"","preferredStorage":"","concerns":[],"sourceChannel":"","lostReason":"","nextFollowupAt":None}
+        amounts=[]
+        chinese_digits={"一":1,"二":2,"两":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9}
+        for raw,unit in re.findall(r"([一二两三四五六七八九])\s*(千|万)",text):
+            amounts.append(float(chinese_digits[raw] * (1000 if unit=="千" else 10000)))
+        for raw,unit in re.findall(r"(\d+(?:\.\d+)?)\s*(万|千|k|K|元)?",text):
+            value=float(raw)*(10000 if unit=="万" else 1000 if unit in ("千","k","K") else 1)
+            if 100<=value<=200000: amounts.append(value)
+        if "预算" in text and amounts:
+            suggestions["budgetMax"]=max(amounts[:2]); suggestions["budgetMin"]=min(amounts[:2]) if len(amounts)>1 else None
+        brands=("iPhone","苹果","华为","荣耀","小米","红米","OPPO","vivo","一加","三星","魅族")
+        suggestions["preferredBrand"]=next((brand for brand in brands if brand.lower() in text.lower()),"")
+        model_match=re.search(r"((?:iPhone|苹果|华为|Mate|Pura|荣耀|小米|红米|OPPO|vivo|Find|X)\s*[A-Za-z0-9\s+\-]{1,24}(?:Pro\s*Max|Pro|Max|Ultra|标准版|青春版)?)",text,re.I)
+        if model_match:suggestions["preferredModel"]=model_match.group(1).strip()
+        storage=re.search(r"\b(64|128|256|512)\s*[gG](?:[bB])?\b|\b([12])\s*[tT](?:[bB])?\b",text)
+        if storage:suggestions["preferredStorage"]=(storage.group(1)+"GB") if storage.group(1) else (storage.group(2)+"TB")
+        concern_map={"价格":["价格","便宜","贵","预算"],"电池":["电池","续航"],"外观":["外观","成色","划痕","磕碰"],"拆修":["拆修","维修","原装"],"质保":["质保","保修"],"拍照":["拍照","相机","摄像"],"容量":["容量","内存"]}
+        suggestions["concerns"]=[name for name,words in concern_map.items() if any(word in text for word in words)]
+        source_map={"抖音":"抖音","微信":"微信","转介绍":"转介绍","朋友介绍":"转介绍","老客户":"老客户","京东":"京东","路过":"到店","进店":"到店"}
+        suggestions["sourceChannel"]=next((value for key,value in source_map.items() if key in text),"")
+        lost_map={"价格未谈拢":["太贵","价格没谈拢","价格不合适"],"暂无合适库存":["没货","没有合适","缺货"],"电池不满意":["电池不满意","电池低"],"外观不满意":["外观不满意","成色不好"],"担心拆修":["担心拆修","不是原装"],"仍在考虑":["考虑一下","再看看","回去想想"],"选择同行":["别家","同行"]}
+        suggestions["lostReason"]=next((name for name,words in lost_map.items() if any(word in text for word in words)),"")
+        today=datetime.now(); follow=None
+        if "后天" in text: follow=today+timedelta(days=2)
+        elif "明天" in text: follow=today+timedelta(days=1)
+        elif "下周" in text: follow=today+timedelta(days=7)
+        if follow:suggestions["nextFollowupAt"]=follow.replace(hour=10,minute=0,second=0,microsecond=0).astimezone().isoformat(timespec="seconds")
+        sensitive=[word for word in ("身份证","住址","病史","收入","职业","家庭情况","有钱","穷","岁","学生") if word in text]
+        warnings=[]
+        if sensitive:warnings.append("速记包含可能不必要的身份、年龄、职业、家庭或健康信息，请删除后再保存："+"、".join(sensitive))
+        return {"originalText":text,"suggestions":suggestions,"warnings":warnings,"requiresConfirmation":True,"parser":"local-rules-v1"}
+
+    def customer_insights(self, user: dict) -> dict:
+        if user["role"]!="owner": raise ApiError(HTTPStatus.FORBIDDEN,"只有老板可以查看客户经营洞察")
+        query=parse_qs(urlparse(self.path).query); mode=query.get("mode",["internal"])[0]
+        with connect() as db:
+            rows=[dict(row) for row in db.execute("select source_channel,preferred_model,concerns,outcome,lost_reason,budget_min,budget_max,occurred_at from customer_interactions where shop_id=? and completion_status='completed'",(user["shop_id"],))]
+        def grouped(key:str):
+            counts={}
+            for row in rows:
+                value=str(row.get(key) or "").strip()
+                if value: counts[value]=counts.get(value,0)+1
+            return [{"label":label,"count":count} for label,count in sorted(counts.items(),key=lambda item:(-item[1],item[0])) if mode!="content" or count>=5]
+        concern_counts={}
+        for row in rows:
+            try: values=json.loads(row.get("concerns") or "[]")
+            except json.JSONDecodeError: values=[]
+            for value in values: concern_counts[str(value)]=concern_counts.get(str(value),0)+1
+        concerns=[{"label":label,"count":count} for label,count in sorted(concern_counts.items(),key=lambda item:(-item[1],item[0])) if mode!="content" or count>=5]
+        budgets=[value for row in rows for value in (row.get("budget_max"),) if value is not None]
+        return {"mode":"content" if mode=="content" else "internal","sampleCount":len(rows),"sources":grouped("source_channel"),"models":grouped("preferred_model"),"outcomes":grouped("outcome"),"lostReasons":grouped("lost_reason"),"concerns":concerns,"averageBudget":round(sum(budgets)/len(budgets),2) if budgets else None,"privacy":{"containsPersonalInformation":False,"minimumPublicSegment":5 if mode=="content" else None}}
 
     def list_events(self, user: dict) -> list[dict]:
         with connect() as db:

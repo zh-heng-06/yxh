@@ -51,7 +51,8 @@ export class LocalClient {
   createPricingDecision(data){return this.request("/api/market/decisions",{method:"POST",body:data});}
   priceSuggestion(id){return this.request(`/api/devices/${encodeURIComponent(id)}/price-suggestion`);}
   salesCopy(id){return this.request(`/api/devices/${encodeURIComponent(id)}/sales-copy`);}
-  addPhoto(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/photos`,{method:"POST",body:data});}
+  addPhoto(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/photos`,{method:"POST",body:data,timeout:30000});}
+  confirmAppearance(id,result){return this.request(`/api/devices/${encodeURIComponent(id)}/appearance/confirm`,{method:"POST",body:{result}});}
   importCsv(csv){return this.request("/api/import/devices.csv",{method:"POST",body:{csv}});}
   devices(query="",scope="today_intake"){const p=new URLSearchParams();if(query)p.set("q",query);if(scope)p.set("scope",scope);return this.request(`/api/devices?${p}`);}
   device(id){return this.request(`/api/devices/${encodeURIComponent(id)}`);}
@@ -80,4 +81,15 @@ export class LocalClient {
   createAfterSales(id,data){return this.request(`/api/devices/${encodeURIComponent(id)}/after-sales`,{method:"POST",body:data});}
   resolveAfterSales(id,data){return this.request(`/api/after-sales/${encodeURIComponent(id)}/resolve`,{method:"POST",body:data});}
   access(){return this.request("/api/access");}
+  customerTasks(status="pending"){const p=new URLSearchParams({status});return this.request(`/api/customer-tasks?${p}`);}
+  customerInteraction(id){return this.request(`/api/customer-interactions/${encodeURIComponent(id)}`);}
+  createCustomerInteraction(data){return this.request("/api/customer-interactions",{method:"POST",body:data});}
+  completeCustomerInteraction(id,data){return this.request(`/api/customer-interactions/${encodeURIComponent(id)}/complete`,{method:"POST",body:data});}
+  parseCustomerNote(text){return this.request("/api/customer-notes/parse",{method:"POST",body:{text}});}
+  customers(query="",reviewDue=false){const p=new URLSearchParams();if(query)p.set("q",query);if(reviewDue)p.set("reviewDue","1");return this.request(`/api/customers?${p}`);}
+  customer(id){return this.request(`/api/customers/${encodeURIComponent(id)}`);}
+  updateCustomer(id,data){return this.request(`/api/customers/${encodeURIComponent(id)}/update`,{method:"POST",body:data});}
+  revealCustomerContact(id){return this.request(`/api/customers/${encodeURIComponent(id)}/reveal-contact`,{method:"POST",body:{}});}
+  anonymizeCustomer(id){return this.request(`/api/customers/${encodeURIComponent(id)}/anonymize`,{method:"POST",body:{}});}
+  customerInsights(mode="internal"){const p=new URLSearchParams({mode});return this.request(`/api/customer-insights?${p}`);}
 }

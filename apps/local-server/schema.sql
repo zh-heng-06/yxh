@@ -57,6 +57,7 @@ create table if not exists devices (
   notes text not null default '',
   source_fields text not null default '{}',
   intake_state text not null default 'complete' check (intake_state in ('pending','complete')),
+  appearance_status text not null default 'pending' check (appearance_status in ('pending','complete_no_defect','complete_with_defect')),
   created_by text not null references users(id),
   updated_by text not null references users(id),
   created_at text not null,
@@ -218,6 +219,58 @@ create table if not exists device_photos (
   created_by text not null references users(id),
   created_at text not null
 );
+
+create table if not exists customers (
+  id text primary key,
+  shop_id text not null references shops(id),
+  display_name text not null default '',
+  phone text not null default '',
+  phone_normalized text not null default '',
+  phone_tail text not null default '',
+  consent_status text not null default 'anonymous' check (consent_status in ('anonymous','consented')),
+  consent_at text,
+  status text not null default 'active' check (status in ('active','anonymized')),
+  last_interaction_at text,
+  review_due_at text,
+  created_by text not null references users(id),
+  updated_by text not null references users(id),
+  created_at text not null,
+  updated_at text not null
+);
+create unique index if not exists customers_shop_phone_unique on customers(shop_id,phone_normalized) where phone_normalized<>'' and status='active';
+create index if not exists customers_shop_last_idx on customers(shop_id,status,last_interaction_at desc);
+create index if not exists customers_shop_review_idx on customers(shop_id,status,review_due_at);
+
+create table if not exists customer_interactions (
+  id text primary key,
+  shop_id text not null references shops(id),
+  customer_id text references customers(id),
+  sale_id text references sales(id),
+  device_id text references devices(id),
+  interaction_type text not null default 'inquiry' check (interaction_type in ('purchase','sell_to_store','inquiry','trade_in','repair','other')),
+  completion_status text not null default 'pending' check (completion_status in ('pending','completed','dismissed')),
+  source_channel text not null default '',
+  budget_min real check (budget_min is null or budget_min>=0),
+  budget_max real check (budget_max is null or budget_max>=0),
+  preferred_brand text not null default '',
+  preferred_model text not null default '',
+  preferred_storage text not null default '',
+  concerns text not null default '[]',
+  outcome text not null default '',
+  lost_reason text not null default '',
+  next_followup_at text,
+  raw_note text not null default '',
+  confirmed_summary text not null default '',
+  created_by text not null references users(id),
+  updated_by text not null references users(id),
+  occurred_at text not null,
+  created_at text not null,
+  updated_at text not null
+);
+create unique index if not exists customer_interactions_sale_unique on customer_interactions(sale_id) where sale_id is not null;
+create index if not exists customer_interactions_shop_task_idx on customer_interactions(shop_id,completion_status,created_at desc);
+create index if not exists customer_interactions_customer_idx on customer_interactions(customer_id,occurred_at desc);
+create index if not exists customer_interactions_followup_idx on customer_interactions(shop_id,next_followup_at) where completion_status='completed';
 
 create table if not exists reservations (
   id text primary key,
