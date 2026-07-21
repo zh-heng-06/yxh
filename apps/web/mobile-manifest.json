@@ -1,0 +1,11 @@
+{
+  "id": "/?layout=mobile",
+  "name": "掌柜台 · 手机工作台",
+  "short_name": "掌柜台",
+  "start_url": "/?layout=mobile",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f3f2ec",
+  "theme_color": "#10241a",
+  "icons": [{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
+}

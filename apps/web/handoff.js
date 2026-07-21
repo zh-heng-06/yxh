@@ -19,6 +19,8 @@ async function boot(){
   badge.textContent=warranty.status==="none"?"本单未提供门店质保":`门店质保 ${warranty.days}天 · 至 ${(warranty.expiresAt||"").slice(0,10)}${warranty.status==="expired"?" · 已过期":""}`;
   $("#warranty-terms").textContent=warranty.terms;$("#disclosure").textContent=data.disclosure||"未额外记录已知情况";$("#unchecked").textContent=data.unchecked||"未额外记录未检测项";
   const checklist=$("#checklist");(data.checklist.length?data.checklist:["未记录交机确认项"]).forEach(value=>{const item=document.createElement("li");item.textContent=value;if(!data.checklist.length)item.className="empty";checklist.append(item);});
+  const photos=Array.isArray(data.photos)?data.photos:[],photoLabels={front:"正面",back:"背面",frame:"边框",defect:"瑕疵",other:"其他"};
+  if(photos.length){const box=$("#appearance-photos");photos.forEach((photo,index)=>{const link=document.createElement("a"),image=document.createElement("img"),label=document.createElement("span");link.href=photo.url;link.target="_blank";link.rel="noopener";image.src=photo.url;image.alt=`${photoLabels[photo.photo_type]||"外观"}照片 ${index+1}`;image.loading="lazy";label.textContent=photoLabels[photo.photo_type]||"外观";link.append(image,label);box.append(link)});$("#appearance-section").hidden=false}
   $("#notice").textContent=data.notice;$("#save-card").href=data.cardUrl;$("#loading").hidden=true;$("#handoff-card").hidden=false;
 }
 

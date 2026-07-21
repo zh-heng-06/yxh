@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#17251d">
   <title>放心交接卡</title>
   <link rel="icon" href="/icon.svg">
-  <link rel="stylesheet" href="/handoff.css?v=1">
+  <link rel="stylesheet" href="/handoff.css?v=2">
 </head>
 <body>
   <main id="handoff-card" hidden>
@@ -35,12 +35,17 @@
       <h3>未检测或无法确认</h3><p id="unchecked"></p>
       <h3>当面交机确认</h3><ul id="checklist"></ul>
     </section>
+    <section id="appearance-section" hidden>
+      <h2>成交时外观留档</h2>
+      <p class="photo-note">以下照片与本次成交设备一同留存，可点击查看原图或长按保存。</p>
+      <div id="appearance-photos" class="appearance-photos"></div>
+    </section>
     <p id="notice" class="footnote"></p>
     <a id="save-card" class="save" download>保存交接卡长图</a>
     <p class="tip">请保存到手机相册，离开门店Wi-Fi后仍可查看。</p>
   </main>
   <section id="loading" class="state">正在读取交接卡…</section>
   <section id="error" class="state error" hidden><h1>交接卡无法打开</h1><p id="error-message"></p><small>请联系门店核对或补发新的交接码。</small></section>
-  <script type="module" src="/handoff.js?v=1"></script>
+  <script type="module" src="/handoff.js?v=2"></script>
 </body>
 </html>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from integration_smoke import Client, check, image_data_url
 
@@ -38,7 +39,16 @@ def main() -> int:
     owner.call(f"/api/devices/{quick['id']}/update", "POST", {"brand":"华为","model":"Mate 70 Pro","storage":"512GB","imei":"359000000000002","listPrice":5000,"conditionGrade":"95新","markComplete":True})
     check(owner.call(f"/api/devices/{quick['id']}")["intake_state"] == "complete", "快速入库在手机同接口补全后可售")
 
-    sale = owner.call(f"/api/devices/{full['id']}/sell", "POST", {"salePrice":5500,"paymentMethod":"微信","customerQuickNote":"预算六千，想要苹果，关注电池，明天联系"})
+    sale = owner.call(f"/api/devices/{full['id']}/sell", "POST", {"salePrice":5500,"paymentMethod":"微信","customerQuickNote":"预算六千，想要苹果，关注电池，明天联系","handoffDisclosure":"屏幕左上角细划痕，亮屏不明显","handoffUnchecked":"未拆机检查内部防水","warrantyTerms":"正常使用中的非人为功能故障送店检测","deliveryExterior":True,"deliveryFunctions":True})
+    handoff_token = parse_qs(urlparse(sale["handoff"]["url"]).query)["t"][0]
+    handoff = owner.call(f"/api/public/handoffs/{handoff_token}")
+    check(handoff["disclosure"].startswith("屏幕左上角") and len(handoff["photos"]) == 2 and all("url" in photo for photo in handoff["photos"]), "交接卡包含机况、质保和成交时外观照片")
+    photo_body, photo_type = owner.call(handoff["photos"][0]["url"], raw=True)
+    check(photo_body and photo_type.startswith("image/"), "交接卡令牌可读取对应外观照片")
+    card_body, card_type = owner.call(sale["handoff"]["cardUrl"], raw=True)
+    check(card_body.startswith(b"\x89PNG") and card_type.startswith("image/png") and len(card_body) > 100_000, "交接卡长图生成并包含外观照片")
+    owner.call(f"/api/public/handoffs/{handoff_token}/photos/not-owned", raw=True, expected=404)
+    check(True, "交接卡拒绝读取不属于该设备的照片")
     tasks = owner.call("/api/customer-tasks")
     check(len(tasks) == 1 and tasks[0]["id"] == sale["customerTaskId"], "每次出库原子生成一条客户待办")
     owner.call(f"/api/devices/{full['id']}/sell", "POST", {"salePrice":5500}, expected=409)
@@ -64,7 +74,7 @@ def main() -> int:
 
     owner.call("/api/users", "POST", {"username":"staff","displayName":"店员","password":"staff12345","role":"staff"}, expected=201)
     staff = Client(args.base); staff.call("/api/login", "POST", {"username":"staff","password":"staff12345"})
-    masked = staff.call("/api/customers")[0]
+    masked = next(row for row in staff.call("/api/customers") if row["phone"])
     check("••••" in masked["phone"] and "13800138000" not in json.dumps(masked, ensure_ascii=False), "店员客户列表默认遮挡手机号")
     revealed = staff.call(f"/api/customers/{first['customerId']}/reveal-contact", "POST", {})
     check(revealed["phone"] == "13800138000", "单个客户查看完整号码")

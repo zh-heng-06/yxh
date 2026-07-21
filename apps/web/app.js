@@ -2,6 +2,9 @@ import { LocalClient } from "./src/local-client.js?v=33";
 
 const api = new LocalClient();
 const $ = selector => document.querySelector(selector);
+document.querySelectorAll('input[name="giftCharger"]').forEach(input => {
+  if (input.nextSibling?.nodeType === Node.TEXT_NODE) input.nextSibling.textContent = " 充电线";
+});
 const money = value => `¥${Number(value || 0).toLocaleString("zh-CN")}`;
 const roles = { owner: "老板", staff: "店员" };
 const statusNames = {
@@ -226,19 +229,24 @@ function showHandoff(handoff) {
 async function openDetail(deviceId) {
   const detail = await api.device(deviceId); currentDetail = detail;
   const form = $("#detail-form");
+  const readOnly = detail.status === "sold";
   if (!$("#completion-block")) {
     form.querySelector(".form-grid").insertAdjacentHTML("afterend", `<section id="completion-block" class="completion-block" hidden><strong>这台手机由忙时快速入库建立</strong><p>核对验机资料和销售标价后，勾选完成补全。完成前系统会阻止出库。</p><label class="check"><input name="markComplete" type="checkbox"> 我已核对资料，允许出售</label></section>`);
   }
   $("#detail-title").textContent = `${detail.model} · ${detail.stock_code}`;
   const values = {deviceId:detail.id,model:detail.model,storage:detail.storage,color:detail.color,systemVersion:detail.system_version,batteryHealth:detail.battery_health,chargeCycles:detail.charge_cycles,conditionGrade:detail.condition_grade,listPrice:detail.list_price,area:detail.area,notes:detail.notes};
   Object.entries(values).forEach(([key,value]) => { if(form.elements[key]) form.elements[key].value = value ?? ""; });
+  form.querySelectorAll(".form-grid input, .form-grid select, .form-grid textarea").forEach(field => field.disabled = readOnly);
   form.elements.markComplete.checked = false;
   $("#completion-block").hidden = detail.intake_state !== "pending";
   $("#detail-status").value = detail.status;
+  $("#detail-status").disabled = readOnly;
   $("#detail-private").innerHTML = detail.imei ? `<section class="settings-block"><strong>IMEI：${esc(detail.imei)}</strong><small>IMEI2：${esc(detail.imei2 || "-")} · 序列号：${esc(detail.serial_number || "-")}</small>${user.role === "owner" ? `<small>收货成本：${money(detail.purchase_cost)}</small>` : ""}</section>` : "";
   $("#detail-photos").innerHTML = detail.photos.map(photo => `<img src="/api/photos/${encodeURIComponent(photo.id)}" alt="${esc(photo.description)}">`).join("");
   $("#detail-events").innerHTML = detail.events.map(item => `<div class="event-row"><strong>${esc(eventNames[item.event_type] || item.event_type)} · ${esc(item.actor_name)}</strong><small>${new Date(item.created_at).toLocaleString("zh-CN")} ${esc(item.note || "")}</small></div>`).join("");
-  $("#workflow-status").textContent = detail.intake_state === "pending" ? "待补全：完成验机和销售标价后才能出库" : detail.reservation ? `预订客户：${detail.reservation.customer_name}，订金 ${money(detail.reservation.deposit)}` : detail.repair ? `送修：${detail.repair.issue}（${detail.repair.vendor || "未填维修方"}）` : `当前状态：${statusNames[detail.status] || detail.status}`;
+  $("#workflow-status").textContent = readOnly ? "已出库：设备资料和外观留档已锁定，只能查看；如需重新入库，请使用销售退货流程。" : detail.intake_state === "pending" ? "待补全：完成验机和销售标价后才能出库" : detail.reservation ? `预订客户：${detail.reservation.customer_name}，订金 ${money(detail.reservation.deposit)}` : detail.repair ? `送修：${detail.repair.issue}（${detail.repair.vendor || "未填维修方"}）` : `当前状态：${statusNames[detail.status] || detail.status}`;
+  $("#detail-save").hidden = readOnly;
+  $("#detail-photo-file").closest(".settings-block").hidden = readOnly;
   $("#reserve-device").hidden = detail.status !== "in_stock";
   $("#cancel-reservation").hidden = !detail.reservation;
   $("#repair-device").hidden = ["sold","in_repair"].includes(detail.status);
@@ -247,8 +255,10 @@ async function openDetail(deviceId) {
   const latestSale = detail.latestSale;
   $("#after-sales-block").hidden = !latestSale;
   if (latestSale) {
+    const giftItems = [[latestSale.gift_case,"送壳"],[latestSale.gift_screen_protector,"送膜"],[latestSale.gift_charging_head,"送充电头"],[latestSale.gift_charger,"送充电线"]];
+    const giftText = giftItems.map(([selected,label]) => `${label}：${selected ? "是" : "否"}`).join(" · ");
     const warrantyText = latestSale.warranty_status === "none" ? "本单未提供门店质保" : `质保${latestSale.warranty_days}天，至 ${new Date(latestSale.warranty_expires_at).toLocaleDateString("zh-CN")}（${latestSale.warranty_status === "active" ? "质保期内" : "已过期"}）`;
-    $("#warranty-status").innerHTML = `<p class="warranty ${latestSale.warranty_status}">${esc(warrantyText)}</p>`;
+    $("#warranty-status").innerHTML = `<p class="sale-snapshot">成交价 ${money(latestSale.sale_price)} · ${esc(latestSale.payment_method || "未记录支付方式")}<br>${esc(giftText)}</p><p class="warranty ${latestSale.warranty_status}">${esc(warrantyText)}</p>`;
     $("#after-sales-list").innerHTML = detail.afterSales.length ? detail.afterSales.map(item => `<div class="after-sales-row"><span><b>${item.status === "open" ? "待处理" : "已完成"}：${esc(item.issue)}</b><small>${new Date(item.created_at).toLocaleString("zh-CN")}${item.resolution ? ` · 结果：${esc(item.resolution)}` : ""}${user.role === "owner" && item.service_cost ? ` · 成本${money(item.service_cost)}` : ""}</small></span>${item.status === "open" ? `<button type="button" data-resolve-after-sales="${esc(item.id)}">完成处理</button>` : ""}</div>`).join("") : `<p class="empty-inline">暂无售后记录</p>`;
     const handoff = detail.handoff;
     $("#handoff-status").innerHTML = handoff ? `<p class="handoff-state ${handoff.status === "void" ? "void" : ""}">${handoff.status === "active" ? `交接卡 ${esc(handoff.handoff_number)} · 已查看${handoff.view_count}次` : `交接卡 ${esc(handoff.handoff_number)} · 已作废`}</p>` : `<p class="handoff-state void">这笔销售尚未生成顾客交接卡</p>`;
@@ -545,10 +555,10 @@ async function loadLedger() {
   const result = await api.ledger(day);
   ledgerRows = result.rows;
   const s = result.summary;
-  $("#ledger-summary").innerHTML = `<article><small>售出</small><strong>${s.count} 台</strong></article><article><small>成交额</small><strong>${money(s.revenue)}</strong></article>${user.role==="owner"?`<article><small>利润</small><strong>${money(s.profit)}</strong></article>`:""}<article class="gift-total"><small>赠品合计</small><strong>壳 ${s.giftCase} · 膜 ${s.giftScreenProtector} · 充电头 ${s.giftChargingHead} · 充电器 ${s.giftCharger}</strong></article>`;
+  $("#ledger-summary").innerHTML = `<article><small>售出</small><strong>${s.count} 台</strong></article><article><small>成交额</small><strong>${money(s.revenue)}</strong></article>${user.role==="owner"?`<article><small>利润</small><strong>${money(s.profit)}</strong></article>`:""}<article class="gift-total"><small>赠品合计</small><strong>壳 ${s.giftCase} · 膜 ${s.giftScreenProtector} · 充电头 ${s.giftChargingHead} · 充电线 ${s.giftCharger}</strong></article>`;
   $("#ledger-head").innerHTML = `<tr><th>时间</th><th>型号 / 容量</th><th>串号</th><th>赠品</th><th>成交价</th>${user.role==="owner"?"<th>回收价</th><th>利润</th><th>更正</th>":""}</tr>`;
   $("#ledger-body").innerHTML = result.rows.length ? result.rows.map(row => {
-    const gifts = [[row.gift_case,"壳"],[row.gift_screen_protector,"膜"],[row.gift_charging_head,"充电头"],[row.gift_charger,"充电器"]].filter(x=>x[0]).map(x=>x[1]).join("、") || "无";
+    const gifts = [[row.gift_case,"壳"],[row.gift_screen_protector,"膜"],[row.gift_charging_head,"充电头"],[row.gift_charger,"充电线"]].filter(x=>x[0]).map(x=>x[1]).join("、") || "无";
     const time = new Date(row.sold_at).toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit"});
     return `<tr class="${row.returned?"returned":""}"><td>${time}${row.returned?"<em>已退货</em>":""}</td><td><b>${esc(row.model)}</b><small>${esc(row.storage)} · ${esc(row.sold_by_name)}</small></td><td>${esc(row.imei)}</td><td>${gifts}</td><td>${money(row.sale_price)}</td>${user.role==="owner"?`<td>${money(row.purchase_cost_snapshot)}</td><td>${money(row.sale_price-row.purchase_cost_snapshot)}</td><td><button type="button" data-edit-sale="${row.id}">修改</button></td>`:""}</tr>`;
   }).join("") : `<tr><td colspan="8" class="empty-cell">当天暂无销售记录</td></tr>`;

@@ -56,9 +56,9 @@ try:
 except ImportError:
     zxingcpp = None
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
 except ImportError:
-    Image = ImageDraw = ImageFont = None
+    Image = ImageDraw = ImageFont = ImageOps = None
 try:
     from ocr_intake import recognize_device_screenshot
 except ImportError:
@@ -836,6 +836,9 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 if len(parts) == 5 and parts[4] == "card.png":
                     self.require_public_rate("handoff-card", parts[3], 6)
                     return self.send_handoff_card(parts[3])
+                if len(parts) == 6 and parts[4] == "photos":
+                    self.require_public_rate("handoff-photo", parts[3], 60)
+                    return self.send_public_handoff_photo(parts[3], parts[5])
                 raise ApiError(HTTPStatus.NOT_FOUND, "交接卡地址不存在")
             if path == "/api/setup-status":
                 with connect() as db: configured = db.execute("select exists(select 1 from users)").fetchone()[0] == 1
@@ -1369,6 +1372,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         with WRITE_LOCK, connect() as db:
             before = db.execute("select * from devices where id=? and shop_id=? and deleted_at is null", (device_id,user["shop_id"])).fetchone()
             if not before: raise ApiError(HTTPStatus.NOT_FOUND, "没有找到设备")
+            if before["status"] == "sold": raise ApiError(HTTPStatus.CONFLICT, "已出库设备的资料已锁定；如需重新入库，请先走销售退货流程")
             if mark_complete:
                 merged = dict(before)
                 merged.update(values)
@@ -1691,6 +1695,9 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 d.condition_grade,sh.name shop_name,u.display_name sold_by_name
                 from sales s join devices d on d.id=s.device_id join shops sh on sh.id=s.shop_id
                 join users u on u.id=s.sold_by where s.id=? and s.shop_id=?""", (sale_id,user["shop_id"])).fetchone()
+            photos = [dict(photo) for photo in db.execute("""select id,photo_type,description from device_photos
+                where device_id=? and shop_id=? and photo_type in ('front','back','frame','defect','other')
+                order by created_at,id""", (row["device_id"],user["shop_id"]))] if row else []
         if not row:
             raise ApiError(HTTPStatus.NOT_FOUND, "没有找到销售记录")
         truthy = lambda key: str(data.get(key, "")).lower() in ("1","true","on","yes")
@@ -1701,11 +1708,11 @@ class StoreHandler(SimpleHTTPRequestHandler):
             "deliveryGifts": "随机赠品已当面点清",
         }
         warranty_days = int(row["warranty_days"] or 0)
-        default_terms = "门店质保覆盖正常使用中的非人为功能故障；摔碰、进水、私自拆修等情况需检测后确认。" if warranty_days else "本单未提供门店质保，但不影响法律法规规定的权利。"
+        default_terms = ("质保期内，正常使用出现主板、屏幕显示或触控、摄像、听筒、扬声器、充电等非人为功能故障，请送回门店检测。确认属于质保范围后，由门店维修、换同等设备或协商处理。摔碰挤压、进液受潮、弯曲破裂、私自拆修、刷机越狱、账号锁或密码遗失、非原装配件造成的损坏，以及电池与外观的正常损耗，不属于门店质保。资料请自行备份，检测维修可能导致数据丢失；法律法规另有规定的，从其规定。" if warranty_days else "本单未提供门店质保，但不影响法律法规规定的权利。")
         disclosure = str(data.get("handoffDisclosure", "")).strip()[:500]
         unchecked = str(data.get("handoffUnchecked", "")).strip()[:300]
         warranty_terms = str(data.get("warrantyTerms", "")).strip()[:500] or default_terms
-        gifts = [label for key,label in (("gift_case","手机壳"),("gift_screen_protector","手机膜"),("gift_charging_head","充电头"),("gift_charger","充电器")) if row[key]]
+        gifts = [label for key,label in (("gift_case","手机壳"),("gift_screen_protector","手机膜"),("gift_charging_head","充电头"),("gift_charger","充电线")) if row[key]]
         handoff_id = str(uuid.uuid4())
         handoff_number = f"HJ{datetime.now().strftime('%y%m%d')}-{handoff_id[:6].upper()}"
         snapshot = {
@@ -1724,6 +1731,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             "disclosure": disclosure,
             "unchecked": unchecked,
             "checklist": [label for key,label in checklist_labels.items() if truthy(key)],
+            "photos": photos,
             "notice": "本卡是成交时的信息快照，不展示回收成本、利润或完整IMEI。",
         }
         token = secrets.token_urlsafe(32)
@@ -1751,6 +1759,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         expires = snapshot.get("warranty", {}).get("expiresAt")
         snapshot["warranty"]["status"] = "none" if not expires else ("active" if datetime.fromisoformat(expires) >= datetime.now(timezone.utc) else "expired")
         snapshot["cardUrl"] = f"/api/public/handoffs/{token}/card.png"
+        snapshot["photos"] = [{**photo,"url":f"/api/public/handoffs/{token}/photos/{photo['id']}"} for photo in snapshot.get("photos", [])]
         if record_view:
             stamp = now_iso()
             with connect() as db:
@@ -1774,10 +1783,24 @@ class StoreHandler(SimpleHTTPRequestHandler):
         output = io.BytesIO(); image.save(output); body = output.getvalue()
         self.send_response(HTTPStatus.OK); self.send_header("Content-Type","image/svg+xml"); self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(body)
 
-    def render_handoff_card(self, snapshot: dict) -> bytes:
+    def send_public_handoff_photo(self, token: str, photo_id: str) -> None:
+        handoff, _ = self.handoff_by_token(token)
+        with connect() as db:
+            row = db.execute("select file_path from device_photos where id=? and device_id=? and shop_id=? and photo_type in ('front','back','frame','defect','other')", (photo_id,handoff["device_id"],handoff["shop_id"])).fetchone()
+        if not row:
+            raise ApiError(HTTPStatus.NOT_FOUND, "交接卡中没有这张照片")
+        path = (DB_PATH.parent / row["file_path"]).resolve()
+        if DB_PATH.parent.resolve() not in path.parents or not path.is_file():
+            raise ApiError(HTTPStatus.NOT_FOUND, "照片文件不存在")
+        body = path.read_bytes()
+        content_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        self.send_response(HTTPStatus.OK); self.send_header("Content-Type",content_type); self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","private,max-age=3600"); self.end_headers(); self.wfile.write(body)
+
+    def render_handoff_card(self, snapshot: dict, photo_paths: list[tuple[str, Path]] | None = None) -> bytes:
         if Image is None or ImageDraw is None or ImageFont is None:
             raise ApiError(HTTPStatus.NOT_IMPLEMENTED, "图片组件未安装")
-        width, max_height = 1080, 5200
+        card_photo_count = min(len(photo_paths or []), 20)
+        width, max_height = 1080, 5200 + ((card_photo_count + 1) // 2) * 375
         canvas = Image.new("RGB", (width,max_height), "#f4f1e8")
         draw = ImageDraw.Draw(canvas)
         font_path = next((path for path in (r"C:\Windows\Fonts\msyh.ttc",r"C:\Windows\Fonts\simhei.ttf") if Path(path).exists()), None)
@@ -1824,6 +1847,19 @@ class StoreHandler(SimpleHTTPRequestHandler):
         warranty_title = f"{warranty.get('days',0)}天门店质保" if warranty.get("days") else "未提供门店质保"
         section("质保约定",[("质保",warranty_title),("到期日",(warranty.get("expiresAt") or "-")[:10]),("范围",warranty.get("terms") or "-")])
         section("交机说明",[("已知情况",snapshot.get("disclosure") or "未额外记录已知情况"),("未检测项",snapshot.get("unchecked") or "未额外记录未检测项"),("已确认","\n".join(f"· {item}" for item in snapshot.get("checklist",[])) or "未勾选交机确认项")])
+        visible_photos=(photo_paths or [])[:20]
+        if visible_photos:
+            labels={"front":"正面","back":"背面","frame":"边框","defect":"瑕疵","other":"其他"}; rows=(len(visible_photos)+1)//2; height=100+rows*375
+            draw.rounded_rectangle((45,y,width-45,y+height),radius=28,fill=white); draw.text((75,y+28),"成交时外观留档",font=h2_font,fill=accent)
+            for index,(photo_type,path) in enumerate(visible_photos):
+                left=75+(index%2)*475; top=y+90+(index//2)*375
+                try:
+                    with Image.open(path) as source:
+                        tile=ImageOps.fit(ImageOps.exif_transpose(source).convert("RGB"),(430,320),method=Image.Resampling.LANCZOS)
+                    canvas.paste(tile,(left,top)); draw.rounded_rectangle((left+8,top+270,left+110,top+312),radius=10,fill="#17251ddd"); draw.text((left+20,top+278),labels.get(photo_type,"外观"),font=small_font,fill=white)
+                except Exception:
+                    draw.rounded_rectangle((left,top,left+430,top+320),radius=16,fill="#eef1eb"); draw.text((left+130,top+135),"照片读取失败",font=small_font,fill=muted)
+            y += height+25
         footer_lines=wrapped(snapshot.get("notice",""),small_font,width-140)
         draw.multiline_text((70,y+10),"\n".join(footer_lines),font=small_font,fill=muted,spacing=7)
         y += len(footer_lines)*36+70
@@ -1832,13 +1868,24 @@ class StoreHandler(SimpleHTTPRequestHandler):
 
     def send_handoff_card(self, token: str) -> None:
         handoff, snapshot = self.public_handoff_payload(token)
+        photo_ids=[str(photo.get("id") or "") for photo in snapshot.get("photos",[])[:20] if photo.get("id")]
+        photo_paths=[]
+        if photo_ids:
+            placeholders=",".join("?" for _ in photo_ids)
+            with connect() as db:
+                rows={row["id"]:dict(row) for row in db.execute(f"select id,photo_type,file_path from device_photos where device_id=? and shop_id=? and id in ({placeholders})",(handoff["device_id"],handoff["shop_id"],*photo_ids))}
+            for photo_id in photo_ids:
+                row=rows.get(photo_id)
+                if not row: continue
+                path=(DB_PATH.parent/row["file_path"]).resolve()
+                if DB_PATH.parent.resolve() in path.parents and path.is_file(): photo_paths.append((row["photo_type"],path))
         cache_dir = DB_PATH.parent / "handoff-cards"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"{handoff['id']}.png"
+        cache_path = cache_dir / f"{handoff['id']}-v2.png"
         with HANDOFF_CARD_LOCK:
             if not cache_path.exists():
                 temporary = cache_path.with_suffix(".tmp")
-                temporary.write_bytes(self.render_handoff_card(snapshot))
+                temporary.write_bytes(self.render_handoff_card(snapshot,photo_paths))
                 temporary.replace(cache_path)
             body = cache_path.read_bytes()
         stamp = now_iso()
@@ -2024,7 +2071,9 @@ class StoreHandler(SimpleHTTPRequestHandler):
         try: validate_image_bytes(body)
         except ValueError as error: raise ApiError(HTTPStatus.BAD_REQUEST,str(error))
         with connect() as db:
-            if not db.execute("select 1 from devices where id=? and shop_id=?",(device_id,user["shop_id"])).fetchone(): raise ApiError(HTTPStatus.NOT_FOUND,"没有找到设备")
+            device = db.execute("select status from devices where id=? and shop_id=?",(device_id,user["shop_id"])).fetchone()
+            if not device: raise ApiError(HTTPStatus.NOT_FOUND,"没有找到设备")
+            if device["status"] == "sold": raise ApiError(HTTPStatus.CONFLICT,"已出库设备的外观留档已锁定，不能再添加照片")
         suffix=".jpg" if match.group(1).lower() in ("jpeg","jpg") else "."+match.group(1).lower(); photo_id=str(uuid.uuid4()); directory=DB_PATH.parent/"device-photos"; directory.mkdir(parents=True,exist_ok=True); path=directory/f"{photo_id}{suffix}"; path.write_bytes(body); stamp=now_iso()
         description=str(data.get("description","")).strip() or allowed_types[photo_type]
         with connect() as db:
@@ -2040,6 +2089,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
         with WRITE_LOCK, connect() as db:
             device = db.execute("select id,status from devices where id=? and shop_id=? and deleted_at is null", (device_id,user["shop_id"])).fetchone()
             if not device: raise ApiError(HTTPStatus.NOT_FOUND,"没有找到设备")
+            if device["status"] == "sold": raise ApiError(HTTPStatus.CONFLICT,"已出库设备的外观留档已锁定，不能再修改")
             types = {row[0] for row in db.execute("select photo_type from device_photos where device_id=?", (device_id,))}
             missing = [name for key,name in (("front","正面"),("back","背面")) if key not in types]
             if result == "defect_documented" and "defect" not in types: missing.append("瑕疵")
@@ -2693,7 +2743,7 @@ class StoreHandler(SimpleHTTPRequestHandler):
             rows=db.execute("""select s.sold_at,s.model_snapshot,s.storage_snapshot,s.imei_snapshot,s.sale_price,s.purchase_cost_snapshot,
                 s.gift_case,s.gift_screen_protector,s.gift_charging_head,s.gift_charger,s.payment_method,u.display_name,s.customer_note
                 from sales s join users u on u.id=s.sold_by where s.shop_id=? and date(s.sold_at,'localtime')=date(?) order by s.sold_at""",(user["shop_id"],day)).fetchall()
-        headers=["日期时间","型号","容量","串号","成交价"]+(["回收价","利润"] if user["role"]=="owner" else [])+["送壳","送膜","送充电头","送充电器","付款方式","销售人员","备注"]
+        headers=["日期时间","型号","容量","串号","成交价"]+(["回收价","利润"] if user["role"]=="owner" else [])+["送壳","送膜","送充电头","送充电线","付款方式","销售人员","备注"]
         data=[]
         for row in rows:
             serial=row[3] if user["role"]=="owner" else (("••••"+row[3][-4:]) if row[3] else "")
